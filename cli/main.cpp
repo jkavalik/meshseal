@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
         std::cout << "watertight=" << (result.watertight ? "true" : "false")
                   << " is_volume=" << (result.is_volume ? "true" : "false")
                   << " components=" << result.component_count
+                  << " self_intersections=" << result.self_intersections
                   << " confidence=" << result.confidence << "\n";
         for (const auto& note : result.notes) {
             std::cout << "  " << note << "\n";

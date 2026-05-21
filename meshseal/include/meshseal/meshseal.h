@@ -61,6 +61,8 @@ struct RepairResult {
     bool watertight = false;
     bool is_volume = false;
     int component_count = 0;
+    int self_intersections = 0;   // count of distinct triangle pairs that
+                                  // self-intersect (Möller); -1 if not measured
     std::vector<std::string> stages_applied;
     std::map<std::string, double> stage_times_ms;
     std::vector<std::string> notes;            // free-form, backward compat
@@ -99,6 +101,14 @@ struct RepairOptions {
     // hijacking everyday open-mesh repair.
     double soup_planarity_threshold = 0.01;
     double soup_open_ratio_threshold = 0.95;
+
+    // Internal: recursion depth for stages that re-enter repair() on a
+    // locally-modified mesh (currently: nm_carve_refill, which carves the
+    // NM-incident region and needs the full pipeline to settle the carved
+    // mesh — Liepa + collapse_nm alone don't suffice on real-world inputs).
+    // Bumped by the dispatcher; not for user code to set.
+    int  recursion_depth      = 0;
+    bool allow_carve_refill   = true;
 };
 
 RepairResult repair(const Mesh& mesh, const RepairOptions& opts = RepairOptions{});

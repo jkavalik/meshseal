@@ -15,6 +15,7 @@ add_executable(tests_meshseal
     test_thin_features.cpp
     test_soup_reconstruct.cpp
     test_pipeline_architecture.cpp
+    test_alpha_wrap.cpp
 )
 
 target_link_libraries(tests_meshseal

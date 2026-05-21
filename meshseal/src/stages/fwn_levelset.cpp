@@ -1,6 +1,7 @@
 #include "fwn_levelset.h"
 #include "../internal/vec3.h"
 #include "../internal/voxel_grid.h"
+#include "../internal/manifold_weld.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -238,75 +239,6 @@ FwnLevelSetResult fwn_levelset(const Mesh& mesh,
 // run marching cubes on the resulting occupancy field. Orientation-agnostic,
 // which is what FWN is not.
 
-namespace {
-
-// Convert a manifold::Manifold to a Mesh with float32-bit-exact position
-// weld + degenerate-face drop. Shared between fwn_levelset and
-// voxel_levelset, since both produce dense MC output that needs the same
-// post-treatment (MeshGL splits vertices per-property → spurious NM if not
-// welded by position; float32 cast for STL preview must be exact).
-Mesh manifold_to_welded_mesh(const manifold::Manifold& m, std::string& failure_reason) {
-    Mesh out;
-    if (m.Status() != manifold::Manifold::Error::NoError || m.NumTri() == 0) {
-        failure_reason = "LevelSet produced empty mesh";
-        return out;
-    }
-    manifold::MeshGL out_gl = m.GetMeshGL();
-    if (out_gl.triVerts.empty() || out_gl.vertProperties.empty() || out_gl.numProp < 3) {
-        failure_reason = "LevelSet produced invalid MeshGL";
-        return out;
-    }
-    struct F32Key {
-        std::uint32_t x, y, z;
-        bool operator==(const F32Key& o) const {
-            return x == o.x && y == o.y && z == o.z;
-        }
-    };
-    struct F32Hash {
-        std::size_t operator()(const F32Key& k) const {
-            std::size_t h = k.x;
-            h ^= (std::size_t)k.y * 2654435761u + 0x9e3779b9u + (h << 6) + (h >> 2);
-            h ^= (std::size_t)k.z * 2654435761u + 0x9e3779b9u + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-    auto pack = [](float f) -> std::uint32_t {
-        std::uint32_t u; std::memcpy(&u, &f, sizeof(u));
-        return u;
-    };
-    const uint32_t nv = static_cast<uint32_t>(out_gl.vertProperties.size() / out_gl.numProp);
-    std::vector<uint32_t> remap(nv);
-    std::unordered_map<F32Key, uint32_t, F32Hash> dedup;
-    dedup.reserve(nv);
-    for (uint32_t vi = 0; vi < nv; ++vi) {
-        const uint32_t base = vi * out_gl.numProp;
-        const float fx = out_gl.vertProperties[base + 0];
-        const float fy = out_gl.vertProperties[base + 1];
-        const float fz = out_gl.vertProperties[base + 2];
-        F32Key k{pack(fx), pack(fy), pack(fz)};
-        auto it = dedup.find(k);
-        if (it == dedup.end()) {
-            const uint32_t ni = static_cast<uint32_t>(out.vertices.size());
-            out.vertices.push_back({double(fx), double(fy), double(fz)});
-            dedup.emplace(k, ni);
-            remap[vi] = ni;
-        } else {
-            remap[vi] = it->second;
-        }
-    }
-    const uint32_t nt = static_cast<uint32_t>(out_gl.triVerts.size() / 3);
-    out.faces.reserve(nt);
-    for (uint32_t ti = 0; ti < nt; ++ti) {
-        const uint32_t a = remap[out_gl.triVerts[ti*3 + 0]];
-        const uint32_t b = remap[out_gl.triVerts[ti*3 + 1]];
-        const uint32_t c = remap[out_gl.triVerts[ti*3 + 2]];
-        if (a == b || b == c || c == a) continue;
-        out.faces.push_back({a, b, c});
-    }
-    return out;
-}
-
-} // anonymous namespace
 
 FwnLevelSetResult voxel_levelset(const Mesh& mesh,
                                  int voxel_res,
@@ -409,7 +341,7 @@ FwnLevelSetResult voxel_levelset(const Mesh& mesh,
     }
 
     std::string fail;
-    Mesh out = manifold_to_welded_mesh(m, fail);
+    Mesh out = internal::manifold_to_welded_mesh(m, fail);
     if (out.faces.empty()) {
         result.reason = fail;
         return result;

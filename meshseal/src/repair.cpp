@@ -1,6 +1,7 @@
 #include "../include/meshseal/meshseal.h"
 #include "internal/component_classifier.h"
 #include "internal/diagnostics.h"
+#include "internal/si_count.h"
 #include "internal/timer.h"
 #include "stages/weld.h"
 #include "stages/degenerate.h"
@@ -18,6 +19,9 @@
 #include "stages/bridge_loops.h"
 #include "stages/collapse_nm.h"
 #include "stages/tjunction.h"
+#include "stages/alpha_wrap.h"
+#include "stages/nm_local_repair.h"
+#include "stages/nm_carve_refill.h"
 #include "stl_io.h"
 #include <algorithm>
 #include <cstdlib>
@@ -1268,23 +1272,41 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             const int pre_d = static_cast<int>(pre_p.open_boundary_edges) +
                               static_cast<int>(pre_p.non_manifold_edges);
 
-            // Plain local patch (small BFS ring). NOTE: `coplanar_expand`
-            // mode exists on remesh_nm_patches but is intentionally NOT used
-            // here — it swallows whole coplanar sheets and the Liepa refill
-            // then flat-caps a 3-D corner, gouging volume (t10k_1582375 lost
-            // 2.7 % volume + a visible dent for a cosmetic nm4→nm1). The
-            // total-defect guard does not catch geometry damage.
-            auto pr = stages::remesh_nm_patches(result.mesh, /*rings=*/1,
-                                                /*coplanar_expand=*/false);
-            bool improved = pr.applied && defect_of(pr.mesh) < pre_d;
-            if (!improved) break;  // no improvement — stop
+            // Try multiple patch ring sizes; adopt the SMALLEST that
+            // strictly improves defect, fall back to larger only if smaller
+            // doesn't improve. `rings=0` keeps the patch minimal (just NM-
+            // incident faces) which is the right move on a tangled "knot"
+            // of multiple NM edges sharing vertices, where rings=1 over-
+            // deletes and Liepa creates new NM. `rings=2` gives Liepa more
+            // room when the rings=1 boundary is still locked.
+            // NOTE: `coplanar_expand` mode exists on remesh_nm_patches but
+            // is intentionally NOT used here — it swallows whole coplanar
+            // sheets and the Liepa refill then flat-caps a 3-D corner,
+            // gouging volume (t10k_1582375 lost 2.7 % volume + a visible
+            // dent for a cosmetic nm4→nm1). The total-defect guard does
+            // not catch geometry damage.
+            stages::NmPatchResult pr;
+            bool improved = false;
+            int post_d_best = pre_d;
+            for (int rings : {1, 0, 2, 3, 4}) {
+                auto pr_try = stages::remesh_nm_patches(result.mesh, rings,
+                                                       /*coplanar_expand=*/false);
+                if (!pr_try.applied) continue;
+                int post_d_try = defect_of(pr_try.mesh);
+                if (post_d_try < post_d_best) {
+                    pr = std::move(pr_try);
+                    post_d_best = post_d_try;
+                    improved = true;
+                    break;  // smallest ring that helps — use it
+                }
+            }
+            if (!improved) break;  // no ring size improved — stop
 
-            const int post_d = defect_of(pr.mesh);
             add_stage("nm_patch_remesh");
             result.notes.push_back("nm_patch_remesh: removed " +
                 std::to_string(pr.patch_removed) + " patch faces, filled " +
                 std::to_string(pr.faces_filled) + " (defect " +
-                std::to_string(pre_d) + " -> " + std::to_string(post_d) + ")");
+                std::to_string(pre_d) + " -> " + std::to_string(post_d_best) + ")");
             result.mesh = std::move(pr.mesh);
         }
     }
@@ -1319,6 +1341,114 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 } else {
                     result.notes.push_back("collapse_nm: rejected (volume "
                         "change " + std::to_string(dv / v0 * 100.0) + "%)");
+                }
+            }
+        }
+    }
+
+    // --- Late nm_patch_remesh: 2nd pass after collapse_nm ---
+    // The early nm_patch_remesh runs before collapse_nm, so it sees the
+    // pre-collapse state of the mesh. collapse_nm then tidies it. If
+    // residual NM survives both, a 2nd nm_patch_remesh pass can sometimes
+    // close it — the geometry collapse_nm produces is simpler and more
+    // amenable to small-ring patching. Same ring-retry + total-defect guard.
+    if (opts.holes && opts.non_manifold && !result.mesh.faces.empty()) {
+        auto defect_now = [](const Mesh& m) {
+            auto d = internal::compute_diagnostics(m);
+            return static_cast<int>(d.open_boundary_edges) +
+                   static_cast<int>(d.non_manifold_edges);
+        };
+        for (int iter = 0; iter < 3; ++iter) {
+            auto pre_p = internal::compute_diagnostics(result.mesh);
+            if (pre_p.non_manifold_edges == 0) break;
+            const int pre_d = static_cast<int>(pre_p.open_boundary_edges) +
+                              static_cast<int>(pre_p.non_manifold_edges);
+            stages::NmPatchResult pr;
+            bool improved = false;
+            int post_d_best = pre_d;
+            for (int rings : {1, 0, 2, 3, 4}) {
+                auto pr_try = stages::remesh_nm_patches(result.mesh, rings,
+                                                       /*coplanar_expand=*/false);
+                if (!pr_try.applied) continue;
+                int post_d_try = defect_now(pr_try.mesh);
+                if (post_d_try < post_d_best) {
+                    pr = std::move(pr_try); post_d_best = post_d_try;
+                    improved = true; break;
+                }
+            }
+            if (!improved) break;
+            add_stage("nm_patch_remesh");
+            result.notes.push_back("nm_patch_remesh (2nd): removed " +
+                std::to_string(pr.patch_removed) + " patch faces, filled " +
+                std::to_string(pr.faces_filled) + " (defect " +
+                std::to_string(pre_d) + " -> " + std::to_string(post_d_best) + ")");
+            result.mesh = std::move(pr.mesh);
+        }
+    }
+
+    // --- NM-local repair: proximity weld + strict back-to-back dedup ---
+    // Targets residual NM patterns the wider stages leave behind:
+    //   1. CSG-corner near-coincident duplicate vertices (t10k_1582375):
+    //      two vertices at the same chamfer corner separated by ~0.007% of
+    //      bbox, beneath any sensible global weld tolerance. NM-local
+    //      proximity weld at bbox*1e-4 catches them.
+    //   2. Exact-vertex-set back-to-back face pairs (bumpy_white) the wider
+    //      remove_thin_features centroid+normal detector matches together
+    //      with nearby non-pair faces, worsening defect and getting
+    //      rejected. Strict frozenset-vertex-set match isolates the true
+    //      pairs.
+    // Whole-stage guard: total defect (bnd+nm) must strictly improve AND
+    // signed volume must move ≤0.5% — same envelope as collapse_nm.
+    auto _defect_local = [](const Mesh& m) {
+        auto d = internal::compute_diagnostics(m);
+        return static_cast<int>(d.open_boundary_edges) +
+               static_cast<int>(d.non_manifold_edges);
+    };
+    if (!result.mesh.faces.empty()) {
+        auto pre_d = _defect_local(result.mesh);
+        if (pre_d > 0) {
+            auto pre = internal::compute_diagnostics(result.mesh);
+            auto nr = stages::nm_local_repair(result.mesh);
+            if (nr.merges > 0 || nr.pairs_removed > 0) {
+                auto post_d = _defect_local(nr.mesh);
+                auto post = internal::compute_diagnostics(nr.mesh);
+                const double v0 = std::abs(pre.signed_volume);
+                const double dv = std::abs(post.signed_volume - pre.signed_volume);
+                if (post_d < pre_d && (v0 < 1e-300 || dv <= 0.005 * v0)) {
+                    add_stage("nm_local_repair");
+                    result.notes.push_back("nm_local_repair: " +
+                        std::to_string(nr.merges) + " merges, " +
+                        std::to_string(nr.pairs_removed) +
+                        " back-to-back pair(s) removed (defect " +
+                        std::to_string(pre_d) + " -> " +
+                        std::to_string(post_d) + ")");
+                    result.mesh = std::move(nr.mesh);
+                }
+            }
+        }
+    }
+
+    // --- Late back-to-back duplicate-face removal (centroid+normal) ---
+    // Catches back-to-back pairs introduced by
+    auto _defect = [](const Mesh& m) {
+        auto d = internal::compute_diagnostics(m);
+        return static_cast<int>(d.open_boundary_edges) +
+               static_cast<int>(d.non_manifold_edges);
+    };
+    if (!result.mesh.faces.empty()) {
+        auto pre_d = _defect(result.mesh);
+        if (pre_d > 0) {
+            auto tr = stages::remove_thin_features(result.mesh);
+            if (tr.pairs_found > 0) {
+                auto post_d = _defect(tr.mesh);
+                if (post_d < pre_d) {
+                    add_stage("thin_features");
+                    result.notes.push_back("thin_features (late): removed " +
+                        std::to_string(tr.faces_removed) +
+                        " back-to-back faces (defect " +
+                        std::to_string(pre_d) + " -> " +
+                        std::to_string(post_d) + ")");
+                    result.mesh = std::move(tr.mesh);
                 }
             }
         }
@@ -1495,6 +1625,97 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    // --- NM carve + recursive pipeline re-entry ---
+    // For stubborn residual NM edges that all the local stages failed to
+    // resolve, carve the NM-incident faces + 1-ring halo, then RE-ENTER
+    // repair() recursively on the carved mesh. The Python prototype
+    // (`carve_minimal.py`) proved this: carve 41 faces on black_vase,
+    // run meshseal CLI fresh on the result → nm 1 → 0 CLEAN, vol +0.03 %.
+    // The full pipeline (weld → orient → nm_vertex split → … → late
+    // cleanup chain) settles the carved mesh in ways a single-stage
+    // fill_holes + collapse_nm chain cannot replicate.
+    //
+    // Gated:
+    //   - opts.allow_carve_refill must be true (the recursive call sets
+    //     it false, preventing infinite recursion).
+    //   - recursion_depth must be < 2 (paranoia cap on top of the flag).
+    //   - the in-memory mesh must have a position-visible NM edge after
+    //     float32-snap-weld (the residual NM on doubled-surface fixtures
+    //     is often index-space invisible until snapped to float32).
+    //   - the recursive result must strictly improve total defect AND
+    //     stay within 5 % volume of the pre-carve mesh.
+    if (opts.allow_carve_refill && opts.recursion_depth < 2 &&
+        !result.mesh.faces.empty()) {
+        // Float32-snap-weld a probe copy to expose index-invisible NM.
+        Mesh probe = result.mesh;
+        {
+            std::map<std::array<float, 3>, uint32_t> seen;
+            std::vector<std::array<double, 3>> nv;
+            nv.reserve(probe.vertices.size());
+            std::vector<uint32_t> remap(probe.vertices.size());
+            for (uint32_t i = 0; i < probe.vertices.size(); ++i) {
+                std::array<float, 3> key{
+                    static_cast<float>(probe.vertices[i][0]),
+                    static_cast<float>(probe.vertices[i][1]),
+                    static_cast<float>(probe.vertices[i][2])};
+                auto it = seen.find(key);
+                if (it == seen.end()) {
+                    uint32_t idx = static_cast<uint32_t>(nv.size());
+                    seen.emplace(key, idx); remap[i] = idx;
+                    nv.push_back({static_cast<double>(key[0]),
+                                  static_cast<double>(key[1]),
+                                  static_cast<double>(key[2])});
+                } else { remap[i] = it->second; }
+            }
+            Mesh welded;
+            welded.vertices = std::move(nv);
+            welded.faces.reserve(probe.faces.size());
+            for (const auto& f : probe.faces) {
+                uint32_t a = remap[f[0]], b = remap[f[1]], c = remap[f[2]];
+                if (a != b && b != c && a != c) welded.faces.push_back({a,b,c});
+            }
+            probe = std::move(welded);
+        }
+        auto pre = internal::compute_diagnostics(probe);
+        if (pre.non_manifold_edges > 0) {
+            // Carve NM-incident + 1-ring halo. We use the probe (float32-
+            // welded) so that the carve targets the position-visible NM.
+            auto cr = stages::nm_carve_refill(probe, /*halo_rings=*/1);
+            if (cr.applied && cr.faces_carved > 0) {
+                // Build a mesh consisting of the carved-and-Liepa-filled
+                // result, then re-enter repair() on it.
+                RepairOptions nested = opts;
+                nested.recursion_depth   = opts.recursion_depth + 1;
+                nested.allow_carve_refill = false;   // no further recursion
+                RepairResult inner = repair(cr.mesh, nested);
+                auto post = internal::compute_diagnostics(inner.mesh);
+                const double v0 = std::abs(pre.signed_volume);
+                const double dv = std::abs(post.signed_volume - pre.signed_volume);
+                const bool vol_ok = (v0 < 1e-300) || (dv <= 0.05 * v0);
+                if (post.non_manifold_edges < pre.non_manifold_edges &&
+                    post.open_boundary_edges == 0 && vol_ok) {
+                    add_stage("nm_carve_refill");
+                    result.notes.push_back("nm_carve_refill: carved " +
+                        std::to_string(cr.faces_carved) +
+                        " NM-incident faces, re-entered repair() recursively (nm " +
+                        std::to_string(cr.nm_before) + " -> " +
+                        std::to_string(post.non_manifold_edges) + ")");
+                    // Adopt inner result's mesh; merge stages/notes for
+                    // observability (prefix nested notes so the lineage is
+                    // visible in the log).
+                    result.mesh = std::move(inner.mesh);
+                    for (const auto& s : inner.stages_applied)
+                        if (std::find(result.stages_applied.begin(),
+                                      result.stages_applied.end(), s) ==
+                            result.stages_applied.end())
+                            result.stages_applied.push_back(s);
+                    for (const auto& n : inner.notes)
+                        result.notes.push_back("[recursed] " + n);
+                }
+            }
+        }
+    }
+
     // --- Last-resort destruction fallback ---
     // The component-aware pipeline (Phase 5R-10R) assumes each connected
     // component is an independent solid-or-junk. A *fragmented* solid — one
@@ -1504,12 +1725,19 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // result keeps a fraction of the true volume.
     //
     // Detect that here: when the pipeline output is non-watertight, run a
-    // whole-input voxel reconstruction (orientation-/topology-agnostic) and
-    // adopt it ONLY when it is clean AND recovers substantially more volume —
-    // i.e. the pipeline genuinely destroyed the model. Geometry-preserving
-    // near-misses (small residual nm, full volume intact) keep their original
-    // output because the voxel volume does not exceed theirs. Cannot regress
-    // a CLEAN fixture: the fallback never runs on watertight output.
+    // whole-input alpha-wrap reconstruction (morphological closing — bridges
+    // open seams instead of leaking through them, hugs the surface instead
+    // of bloating to the hull) and adopt it ONLY when it is clean AND
+    // recovers substantially more volume — i.e. the pipeline genuinely
+    // destroyed the model. Geometry-preserving near-misses (small residual
+    // nm, full volume intact) keep their original output because the wrap
+    // volume does not exceed theirs by 1.5x. Cannot regress a CLEAN fixture:
+    // the fallback never runs on watertight output.
+    //
+    // The 1.5x volume ratio is the destruction discriminator; a surface-
+    // distance-to-input gate (alpha_wrapping_plan.md §4.4) is the planned
+    // refinement — deferred because a closing, unlike voxel occupancy, does
+    // not burst the bbox, so a wildly-wrong wrap is not a near-term risk.
     if (opts.soup_reconstruct && !result.mesh.faces.empty() && !mesh.faces.empty()) {
         // Check the defect state the way a slicer sees it — at float32 output
         // precision. The in-memory double mesh can be index-watertight while
@@ -1544,10 +1772,19 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         auto cur = internal::compute_diagnostics(probe);
         const bool not_clean = cur.open_boundary_edges > 0 ||
                                cur.non_manifold_edges > 0;
-        if (not_clean) {
-            auto vr = stages::voxel_levelset(mesh);
+        // Genuinely-destroyed pre-gate: only reconstruct when the pipeline
+        // SHREDDED the model — left it as many disconnected components. That
+        // is the signature of a fragmented-solid input the component-aware
+        // pipeline could not keep whole. A geometry-preserving near-miss
+        // (small residual nm, ONE component, geometry intact) is left
+        // untouched — wrapping it would replace correct original geometry
+        // with a coarse remesh, and alpha_wrap can bloat a near-miss enough
+        // to fool a volume-only adopt test.
+        const bool destroyed = not_clean && cur.component_count > 1;
+        if (destroyed) {
+            auto vr = stages::alpha_wrap(mesh);
             if (vr.success && !vr.mesh.faces.empty()) {
-                // The voxel marching-cubes output can carry a few non-manifold
+                // The marching-cubes output can carry a few non-manifold
                 // edges from float32 vertex collisions in dense output — erase
                 // them with the same guarded edge-collapse used elsewhere so
                 // the reconstruction is a clean watertight solid.
@@ -1566,12 +1803,12 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 const double vox_vol = std::abs(vd.signed_volume);
                 if (vox_clean && vox_vol > 1.5 * cur_vol) {
                     result.mesh = std::move(vr.mesh);
-                    add_stage("voxel_levelset");
+                    add_stage("alpha_wrap");
                     result.notes.push_back(
                         "destruction fallback: pipeline output kept only "
                         + std::to_string(cur_vol) + " of ~"
                         + std::to_string(vox_vol) + " volume — recovered via "
-                        "whole-input voxel reconstruction");
+                        "whole-input alpha-wrap reconstruction");
                 }
             }
         }
@@ -1611,6 +1848,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         result.watertight  = (diag.open_boundary_edges == 0 &&
                               diag.non_manifold_edges == 0);
         result.is_volume   = result.watertight && (diag.signed_volume > 0.0);
+        result.self_intersections = internal::count_self_intersections(result.mesh);
         final_signed_vol = diag.signed_volume;
         if (!result.mesh.vertices.empty()) {
             double lo[3] = { result.mesh.vertices[0][0],

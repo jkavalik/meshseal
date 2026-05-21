@@ -21,12 +21,17 @@ add_library(meshseal STATIC
     src/stages/bridge_loops.cpp
     src/stages/collapse_nm.cpp
     src/stages/tjunction.cpp
+    src/stages/alpha_wrap.cpp
+    src/stages/nm_local_repair.cpp
+    src/stages/si_split.cpp
+    src/stages/nm_carve_refill.cpp
     src/internal/halfedge.cpp
     src/internal/bvh.cpp
     src/internal/diagnostics.cpp
     src/internal/component_classifier.cpp
     src/internal/voxel_grid.cpp
     src/internal/arrangement.cpp
+    src/internal/si_count.cpp
 )
 
 target_include_directories(meshseal
