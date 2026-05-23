@@ -1741,7 +1741,18 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             probe = std::move(welded);
         }
         auto pre = internal::compute_diagnostics(probe);
-        if (pre.non_manifold_edges > 0) {
+        // Carve+refill is the right tool for SMALL residual NM (1-10 ish):
+        // the carve is local, the Liepa refill knits a clean patch, the
+        // recursive repair settles it. For LARGE residuals (kytka1: nm=101
+        // after Phase-1 stall-break) the Liepa refill makes things WORSE —
+        // it generates many new NM edges as its fill triangles cross
+        // surrounding geometry. The internal collapse_nm then spends minutes
+        // grinding through a much larger NM set than the input, only to be
+        // rejected by the outer guard. Skip when the residual is too large
+        // for carve+refill to help in any reasonable time.
+        constexpr int kCarveRefillMaxNm = 20;
+        if (pre.non_manifold_edges > 0 &&
+            pre.non_manifold_edges <= kCarveRefillMaxNm) {
             // Carve NM-incident + 1-ring halo. We use the probe (float32-
             // welded) so that the carve targets the position-visible NM.
             auto cr = stages::nm_carve_refill(probe, /*halo_rings=*/1);

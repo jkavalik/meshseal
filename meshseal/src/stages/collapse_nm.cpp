@@ -173,10 +173,12 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
     // entries. On long collapse runs v2f[hot-vertex] bloats with garbage,
     // making evaluate (which iterates v2f[w]) and gather_cand (which
     // iterates v2f[x] for x in nmv/flapv) slower with every collapse.
-    // Compact when total v2f entries exceed 2× the live-entry high water.
+    // Trigger compaction when total v2f entries exceed 2× the live target
+    // (3·alive_faces); the alive count is maintained incrementally by
+    // commit (cheaper than rescanning the alive vector each check).
     std::size_t v2f_entries = 0;
     for (const auto& kv : v2f) v2f_entries += kv.second.size();
-    std::size_t live_v2f_target = v2f_entries;
+    std::size_t alive_faces = F.size();
     auto compact_v2f = [&]() {
         std::size_t new_total = 0;
         for (auto& kv : v2f) {
@@ -194,15 +196,18 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
             new_total += vec.size();
         }
         v2f_entries = new_total;
-        live_v2f_target = new_total;
     };
 
     auto commit = [&](const Eval& ev) {
-        for (uint32_t fi : ev.dead) { sub_face(F[fi]); alive[fi] = 0; }
+        for (uint32_t fi : ev.dead) {
+            sub_face(F[fi]); alive[fi] = 0;
+            --alive_faces;
+        }
         for (const Tri& g : ev.born) {
             uint32_t gi = static_cast<uint32_t>(F.size());
             F.push_back(g);
             alive.push_back(1);
+            ++alive_faces;
             add_face(g);
             for (int k = 0; k < 3; ++k) {
                 v2f[g[k]].push_back(gi);
@@ -323,7 +328,7 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
         // Compact v2f when bloat exceeds 2× the high-water-mark of live
         // entries; otherwise v2f[hot-vertex] grows unboundedly and slows
         // every subsequent evaluate / gather_cand call.
-        if (v2f_entries > live_v2f_target * 2 && v2f_entries > 1024) {
+        if (v2f_entries > 3 * alive_faces * 2 && v2f_entries > 1024) {
             compact_v2f();
         }
     }
@@ -338,12 +343,48 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
     // erodes the flap; the per-collapse volume guard keeps real folded-but-
     // solid features (which enclose volume) untouched.
     if (nm == 0) {
+        // Phase 2 has an O(F)-per-iteration cost: the edge→face map `ef` is
+        // rebuilt from every alive face on each iteration to detect new
+        // anti-parallel manifold edges (the residual region's shape changes
+        // as we collapse). On small meshes that is fine, but on a 500k+ F
+        // mesh each iteration is ~0.5s and Phase 2 can spin for hundreds of
+        // iterations before `flapv.empty()`. SpyroPrint2 (597k F) burned
+        // 600+ s here and never let the rest of the pipeline run.
+        //
+        // Two bounds, whichever fires first:
+        //   - kPh2IterCap = 1000 absolute iteration cap. Trumpet (the
+        //     load-bearing Phase 2 corpus case) needs ~256 collapses and
+        //     finishes in milliseconds; 1000 leaves comfortable headroom.
+        //   - kPh2TimeBudgetSec = 30 s wall-clock from collapse_nm start.
+        //     Phase 1 + Phase 2 combined. Phase 1 is fast (<1s with the
+        //     kytka1-era fixes), so this is effectively a Phase 2 cap. On
+        //     small meshes the time check never fires; on big meshes it
+        //     bounds the damage. The trade is "stop Phase 2 sooner, leave
+        //     a few flap faces" vs. "let the rest of the pipeline run at
+        //     all" — the latter wins.
+        //
+        // A proper fix is incremental `ef` maintenance (analogous to v2f);
+        // left as a follow-up since the cap is enough to unblock the
+        // pathological large-mesh cases.
+        constexpr int    kPh2IterCap        = 1000;
+        constexpr double kPh2TimeBudgetSec  = 30.0;
         int ph2_iters = 0;
         while (collapses < max_collapses) {
             if (_prof && (ph2_iters % 100 == 0))
                 std::fprintf(stderr, "[cnm] ph2 iter=%d elapsed=%6.2fs collapses=%d F=%zu\n",
                              ph2_iters, _elapsed(), collapses, F.size());
             ++ph2_iters;
+            if (ph2_iters > kPh2IterCap) {
+                if (_prof) std::fprintf(stderr,
+                    "[cnm] ph2 iter cap %d hit, breaking\n", kPh2IterCap);
+                break;
+            }
+            if (_elapsed() > kPh2TimeBudgetSec) {
+                if (_prof) std::fprintf(stderr,
+                    "[cnm] ph2 time budget %.1fs exceeded at iter=%d, breaking\n",
+                    kPh2TimeBudgetSec, ph2_iters);
+                break;
+            }
             // face normals (lazily, each pass — region is small)
             std::unordered_map<uint64_t, std::array<uint32_t,2>> ef;
             for (uint32_t fi = 0; fi < F.size(); ++fi) {
@@ -397,7 +438,7 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
                 if (did) break;
             }
             if (!did) break;
-            if (v2f_entries > live_v2f_target * 2 && v2f_entries > 1024) {
+            if (v2f_entries > 3 * alive_faces * 2 && v2f_entries > 1024) {
                 compact_v2f();
             }
         }
