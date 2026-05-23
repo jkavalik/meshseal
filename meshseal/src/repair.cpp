@@ -24,6 +24,7 @@
 #include "stages/nm_carve_refill.h"
 #include "stl_io.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -70,6 +71,47 @@ Mesh float32_weld(const Mesh& in) {
 RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     RepairResult result;
     result.mesh = mesh;
+
+    // --- Input sanity validation ---
+    // Reject corrupt input fast instead of grinding on impossible geometry.
+    // A malformed STL (NaN/Inf coordinates, absurd magnitudes, or a mesh
+    // that is essentially all degenerate faces) would otherwise spin the
+    // pipeline for minutes. Bail immediately with an empty result + note.
+    {
+        bool bad_coord = false;
+        double lo[3] = { 0, 0, 0 }, hi[3] = { 0, 0, 0 };
+        bool first = true;
+        for (const auto& v : mesh.vertices) {
+            for (int k = 0; k < 3; ++k) {
+                const double c = v[k];
+                if (std::isnan(c) || std::isinf(c)) { bad_coord = true; break; }
+                if (first) { lo[k] = hi[k] = c; }
+                else { if (c < lo[k]) lo[k] = c; if (c > hi[k]) hi[k] = c; }
+            }
+            if (bad_coord) break;
+            first = false;
+        }
+        double bbd = 0.0;
+        if (!first) {
+            const double dx = hi[0]-lo[0], dy = hi[1]-lo[1], dz = hi[2]-lo[2];
+            bbd = std::sqrt(dx*dx + dy*dy + dz*dz);
+        }
+        // A real-world printable mesh is at most a few metres; coordinates
+        // are conventionally mm. 1e9 is ~1000 km — anything past that is
+        // certainly garbage, not a unit-scale mistake.
+        const bool absurd_extent = bbd > 1e9;
+        if (bad_coord || absurd_extent) {
+            result.notes.push_back(
+                bad_coord
+                  ? "input rejected: NaN/Inf vertex coordinates (corrupt file)"
+                  : "input rejected: implausible geometry extent (corrupt file)");
+            result.partial_failure = true;
+            result.mesh.vertices.clear();
+            result.mesh.faces.clear();
+            result.self_intersections = 0;
+            return result;
+        }
+    }
 
     // "Do no harm" baseline: record whether the input is already a clean
     // watertight solid at slicer (float32) precision. A repair pipeline must
@@ -118,6 +160,20 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     };
     dump("input", result.mesh);
+
+    // --- profiling: env MESHSEAL_PROFILE → per-stage stderr wall-clock ---
+    const bool prof_env = std::getenv("MESHSEAL_PROFILE") != nullptr;
+    auto prof_t0 = std::chrono::steady_clock::now();
+    auto prof_last = prof_t0;
+    auto prof_lap = [&](const char* label) {
+        if (!prof_env) return;
+        auto now = std::chrono::steady_clock::now();
+        double since_last = std::chrono::duration<double>(now - prof_last).count();
+        double total = std::chrono::duration<double>(now - prof_t0).count();
+        std::fprintf(stderr, "[prof] %-26s %8.2fs  (total %8.2fs)\n",
+                     label, since_last, total);
+        prof_last = now;
+    };
 
     // --- Stage: weld ---
     if (opts.weld && !result.mesh.vertices.empty()) {
@@ -1179,6 +1235,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:T-junction");
     // --- T-junction resolution ---
     // A non-conforming edge — one face spanning an edge whose interior holds
     // collinear vertices the other side splits into sub-edges — reads as a
@@ -1209,6 +1266,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:nm_patch_remesh");
     // --- NM-patch local remesh (Idea C) ---
     // Runs AFTER the cleanup loop: the cleanup loop's fill_holes is itself a
     // common source of residual NM edges (it closes a boundary loop but the
@@ -1311,6 +1369,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:collapse_nm");
     // --- Progressive guarded edge-collapse of residual NM flaps ---
     // Residual non-manifold geometry that patch-remesh cannot resolve (a
     // doubled near-coplanar membrane — a CSG-union seam, e.g. the trumpet
@@ -1346,6 +1405,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:nm_patch_2nd");
     // --- Late nm_patch_remesh: 2nd pass after collapse_nm ---
     // The early nm_patch_remesh runs before collapse_nm, so it sees the
     // pre-collapse state of the mesh. collapse_nm then tidies it. If
@@ -1386,6 +1446,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:nm_local_repair");
     // --- NM-local repair: proximity weld + strict back-to-back dedup ---
     // Targets residual NM patterns the wider stages leave behind:
     //   1. CSG-corner near-coincident duplicate vertices (t10k_1582375):
@@ -1428,6 +1489,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:late_thin");
     // --- Late back-to-back duplicate-face removal (centroid+normal) ---
     // Catches back-to-back pairs introduced by
     auto _defect = [](const Mesh& m) {
@@ -1454,6 +1516,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:junk_drop");
     // --- Final junk-component drop ---
     // Tiny near-zero-volume connected components — back-to-back duplicate-
     // triangle "flaps" left at non-manifold seams (visually confirmed in
@@ -1625,6 +1688,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:nm_carve_refill");
     // --- NM carve + recursive pipeline re-entry ---
     // For stubborn residual NM edges that all the local stages failed to
     // resolve, carve the NM-incident faces + 1-ring halo, then RE-ENTER
@@ -1691,7 +1755,37 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 auto post = internal::compute_diagnostics(inner.mesh);
                 const double v0 = std::abs(pre.signed_volume);
                 const double dv = std::abs(post.signed_volume - pre.signed_volume);
-                const bool vol_ok = (v0 < 1e-300) || (dv <= 0.05 * v0);
+                // Volume guard: reject a recursion that DESTROYED the model
+                // (collapsed or ballooned). Dual scale, pass if EITHER holds:
+                //   (a) dv <= 20 % of signed volume  — for normal solids;
+                //   (b) dv <= 10 % of bounding-box volume — the escape hatch
+                //       for thin / near-flat / heavily-defective parts,
+                //       where signed volume is a tiny, unreliable scale.
+                //       A long thin gnomon blade or a flat eye piece can
+                //       legitimately shift a large *fraction* of its small
+                //       signed volume while moving very little real space
+                //       (Gnomon: 24 % of vol but only 9 % of bbox-volume;
+                //       eyes3: 16 % of vol but 1.8 % of bbox-volume). The
+                //       carve is local (NM faces + 1-ring, <1 % of F) so it
+                //       physically cannot move much true volume regardless.
+                // Genuine destruction fails both: a collapse loses volume
+                // comparable to the whole box, a balloon exceeds it. The
+                // result must ALSO be topologically better (nm down, bnd 0).
+                double bbv = 0.0;
+                if (!probe.vertices.empty()) {
+                    double plo[3] = { probe.vertices[0][0], probe.vertices[0][1],
+                                      probe.vertices[0][2] };
+                    double phi[3] = { plo[0], plo[1], plo[2] };
+                    for (const auto& pv : probe.vertices)
+                        for (int k = 0; k < 3; ++k) {
+                            if (pv[k] < plo[k]) plo[k] = pv[k];
+                            if (pv[k] > phi[k]) phi[k] = pv[k];
+                        }
+                    bbv = (phi[0]-plo[0]) * (phi[1]-plo[1]) * (phi[2]-plo[2]);
+                }
+                const bool vol_ok = (v0 < 1e-300) ||
+                                    (dv <= 0.20 * v0) ||
+                                    (bbv > 0.0 && dv <= 0.10 * bbv);
                 if (post.non_manifold_edges < pre.non_manifold_edges &&
                     post.open_boundary_edges == 0 && vol_ok) {
                     add_stage("nm_carve_refill");
@@ -1716,6 +1810,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:destruction_fb");
     // --- Last-resort destruction fallback ---
     // The component-aware pipeline (Phase 5R-10R) assumes each connected
     // component is an independent solid-or-junk. A *fragmented* solid — one
@@ -1836,6 +1931,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:final_diag");
     dump("final", result.mesh);
 
     // --- Final diagnostics ---

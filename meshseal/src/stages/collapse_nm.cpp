@@ -1,8 +1,11 @@
 #include "collapse_nm.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -80,8 +83,13 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
     for (const auto& f : F) add_face(f);
 
     int nm = 0, bnd = 0;
+    // nm_edges: the set of non-manifold edges, maintained incrementally so
+    // each collapse iteration does NOT rescan the whole edge map. Without
+    // this the Phase-1 loop is O(E) per collapse → O(E·collapses), which
+    // is multi-minute on 400k-face meshes (profiled: kytka1).
+    std::unordered_set<uint64_t> nm_edges;
     for (const auto& kv : e2c) {
-        if (kv.second > 2) ++nm;
+        if (kv.second > 2) { ++nm; nm_edges.insert(kv.first); }
         else if (kv.second == 1) ++bnd;
     }
     result.nm_before = static_cast<uint32_t>(nm);
@@ -126,9 +134,10 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
         std::vector<Tri>      born;
         int    nm_delta = 0, bnd_delta = 0, removed = 0;
         double vol6_delta = 0.0;
+        std::unordered_map<uint64_t, int> delta;  // per-edge count change
     };
     auto evaluate = [&](uint32_t u, uint32_t w, Eval& ev) -> bool {
-        std::unordered_map<uint64_t, int> delta;
+        auto& delta = ev.delta;
         auto it = v2f.find(w);
         if (it == v2f.end()) return false;
         for (uint32_t fi : it->second) {
@@ -160,6 +169,34 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
         }
         return true;
     };
+    // v2f compactor: commit appends to v2f but never removes dead/stale
+    // entries. On long collapse runs v2f[hot-vertex] bloats with garbage,
+    // making evaluate (which iterates v2f[w]) and gather_cand (which
+    // iterates v2f[x] for x in nmv/flapv) slower with every collapse.
+    // Compact when total v2f entries exceed 2× the live-entry high water.
+    std::size_t v2f_entries = 0;
+    for (const auto& kv : v2f) v2f_entries += kv.second.size();
+    std::size_t live_v2f_target = v2f_entries;
+    auto compact_v2f = [&]() {
+        std::size_t new_total = 0;
+        for (auto& kv : v2f) {
+            const uint32_t x = kv.first;
+            auto& vec = kv.second;
+            auto wr = vec.begin();
+            for (auto rd = vec.begin(); rd != vec.end(); ++rd) {
+                const uint32_t fi = *rd;
+                if (!alive[fi]) continue;
+                const Tri& f = F[fi];
+                if (f[0] != x && f[1] != x && f[2] != x) continue;
+                *wr++ = fi;
+            }
+            vec.erase(wr, vec.end());
+            new_total += vec.size();
+        }
+        v2f_entries = new_total;
+        live_v2f_target = new_total;
+    };
+
     auto commit = [&](const Eval& ev) {
         for (uint32_t fi : ev.dead) { sub_face(F[fi]); alive[fi] = 0; }
         for (const Tri& g : ev.born) {
@@ -167,30 +204,91 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
             F.push_back(g);
             alive.push_back(1);
             add_face(g);
-            for (int k = 0; k < 3; ++k) v2f[g[k]].push_back(gi);
+            for (int k = 0; k < 3; ++k) {
+                v2f[g[k]].push_back(gi);
+                ++v2f_entries;
+            }
         }
         nm  += ev.nm_delta;
         bnd += ev.bnd_delta;
+        // Keep nm_edges in sync — only the edges in ev.delta can have
+        // changed count; everything else is untouched. O(|delta|).
+        for (const auto& kv : ev.delta) {
+            auto e = e2c.find(kv.first);
+            const int c = (e == e2c.end()) ? 0 : e->second;
+            if (c > 2) nm_edges.insert(kv.first);
+            else       nm_edges.erase(kv.first);
+        }
+    };
+
+    // Gather collapse candidates: short edges incident to any vertex in
+    // `vset`, reached via the v2f adjacency (NOT a full e2c scan). Produces
+    // exactly the edge set a full scan would — every e2c edge sits on an
+    // alive face, which is in v2f of its vertices — and the (L, key) sort
+    // makes the result order-independent of how edges are visited.
+    auto gather_cand = [&](const std::unordered_set<uint32_t>& vset,
+                           std::vector<std::pair<double, uint64_t>>& cand) {
+        std::unordered_set<uint64_t> seen;
+        for (uint32_t x : vset) {
+            auto it = v2f.find(x);
+            if (it == v2f.end()) continue;
+            for (uint32_t fi : it->second) {
+                if (!alive[fi]) continue;
+                const Tri& f = F[fi];
+                if (f[0]!=x && f[1]!=x && f[2]!=x) continue;   // stale
+                for (int k = 0; k < 3; ++k) {
+                    const uint64_t e = ekey(f[k], f[(k+1)%3]);
+                    if (!seen.insert(e).second) continue;
+                    uint32_t a, b; edecode(e, a, b);
+                    if (!vset.count(a) && !vset.count(b)) continue;
+                    const double L = vdist(V[a], V[b]);
+                    if (L <= max_collapse_len) cand.emplace_back(L, e);
+                }
+            }
+        }
+        std::sort(cand.begin(), cand.end());
     };
 
     int collapses = 0;
 
+    const bool _prof = std::getenv("MESHSEAL_PROFILE") != nullptr;
+    auto _t0 = std::chrono::steady_clock::now();
+    auto _elapsed = [&]() {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _t0).count();
+    };
+    auto _phaselog = [&](const char* label, int colls, int nm_now) {
+        if (_prof) std::fprintf(stderr, "[cnm] %-10s elapsed=%6.2fs collapses=%d nm=%d F=%zu\n",
+                                label, _elapsed(), colls, nm_now, F.size());
+    };
+    _phaselog("ph1_start", 0, nm);
+
     // ---- Phase 1: erase non-manifold edges ----
+    // Stall detector: the "neutral" tier (tier=1) accepts collapses that
+    // hold nm but decimate the region — useful occasionally to escape a
+    // local stall, but on hard real-world inputs (e.g. kytka1, 400k faces,
+    // nm=189) it can spiral indefinitely with little or no nm progress.
+    // Cap consecutive non-improving collapses at 50: that's plenty for the
+    // neutral tier to break a genuine stall, beyond which the stall is
+    // structural and we should accept the partial result.
+    int ph1_iter = 0;
+    int stall_streak = 0;
+    constexpr int kStallCap = 50;
     while (nm > 0 && collapses < max_collapses) {
+        if (_prof && (ph1_iter % 100 == 0))
+            std::fprintf(stderr, "[cnm] ph1 iter=%d elapsed=%6.2fs collapses=%d nm=%d F=%zu nm_edges=%zu\n",
+                         ph1_iter, _elapsed(), collapses, nm, F.size(), nm_edges.size());
+        ++ph1_iter;
+        const int nm_at_iter_start = nm;
+        // NM vertices = endpoints of the incrementally-maintained nm_edges
+        // set (no full e2c scan).
         std::unordered_set<uint32_t> nmv;
-        for (const auto& kv : e2c)
-            if (kv.second > 2) {
-                uint32_t a, b; edecode(kv.first, a, b);
-                nmv.insert(a); nmv.insert(b);
-            }
-        std::vector<std::pair<double, uint64_t>> cand;
-        for (const auto& kv : e2c) {
-            uint32_t a, b; edecode(kv.first, a, b);
-            if (!nmv.count(a) && !nmv.count(b)) continue;
-            double L = vdist(V[a], V[b]);
-            if (L <= max_collapse_len) cand.emplace_back(L, kv.first);
+        for (uint64_t e : nm_edges) {
+            uint32_t a, b; edecode(e, a, b);
+            nmv.insert(a); nmv.insert(b);
         }
-        std::sort(cand.begin(), cand.end());
+        std::vector<std::pair<double, uint64_t>> cand;
+        gather_cand(nmv, cand);
 
         bool did = false;
         for (int tier = 0; tier < 2 && !did; ++tier) {
@@ -215,7 +313,22 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
             }
         }
         if (!did) break;
+        if (nm < nm_at_iter_start) stall_streak = 0;
+        else if (++stall_streak >= kStallCap) {
+            if (_prof) std::fprintf(stderr,
+                "[cnm] ph1 stall break at iter=%d collapses=%d nm=%d (%d consecutive non-improving)\n",
+                ph1_iter, collapses, nm, stall_streak);
+            break;
+        }
+        // Compact v2f when bloat exceeds 2× the high-water-mark of live
+        // entries; otherwise v2f[hot-vertex] grows unboundedly and slows
+        // every subsequent evaluate / gather_cand call.
+        if (v2f_entries > live_v2f_target * 2 && v2f_entries > 1024) {
+            compact_v2f();
+        }
     }
+
+    _phaselog("ph1_done", collapses, nm);
 
     // ---- Phase 2: erase residual zero-volume flaps ----
     // collapse_nm Phase 1 removes the non-manifold edges but a doubled
@@ -225,7 +338,12 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
     // erodes the flap; the per-collapse volume guard keeps real folded-but-
     // solid features (which enclose volume) untouched.
     if (nm == 0) {
+        int ph2_iters = 0;
         while (collapses < max_collapses) {
+            if (_prof && (ph2_iters % 100 == 0))
+                std::fprintf(stderr, "[cnm] ph2 iter=%d elapsed=%6.2fs collapses=%d F=%zu\n",
+                             ph2_iters, _elapsed(), collapses, F.size());
+            ++ph2_iters;
             // face normals (lazily, each pass — region is small)
             std::unordered_map<uint64_t, std::array<uint32_t,2>> ef;
             for (uint32_t fi = 0; fi < F.size(); ++fi) {
@@ -260,13 +378,7 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
             if (flapv.empty()) break;
 
             std::vector<std::pair<double, uint64_t>> cand;
-            for (const auto& kv : e2c) {
-                uint32_t a, b; edecode(kv.first, a, b);
-                if (!flapv.count(a) && !flapv.count(b)) continue;
-                double L = vdist(V[a], V[b]);
-                if (L <= max_collapse_len) cand.emplace_back(L, kv.first);
-            }
-            std::sort(cand.begin(), cand.end());
+            gather_cand(flapv, cand);
 
             bool did = false;
             for (const auto& cd : cand) {
@@ -285,6 +397,9 @@ CollapseNmResult collapse_nm_region(const Mesh& mesh, double max_collapse_len,
                 if (did) break;
             }
             if (!did) break;
+            if (v2f_entries > live_v2f_target * 2 && v2f_entries > 1024) {
+                compact_v2f();
+            }
         }
     }
 
