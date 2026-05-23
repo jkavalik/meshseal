@@ -175,6 +175,89 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         prof_last = now;
     };
 
+    // --- compute_diagnostics cache for result.mesh ---
+    //
+    // compute_diagnostics builds two std::map<,>s sized to O(F) on every
+    // call (edge incidence, sorted-triple face dedup). On 787 k F that is
+    // ~1-2 s per call; the pipeline issues ~12 calls on result.mesh, many
+    // of them pre-stage diagnostics where the previous stage didn't touch
+    // result.mesh (early return). Caching the diag and invalidating on
+    // mesh mutation reclaims most of that wasted work.
+    //
+    // Fingerprint design: data() pointers + sizes + content samples at
+    // begin/middle/end of vertices and faces. Every stage in the pipeline
+    // returns a NEW Mesh (then moved into result.mesh), so the storage
+    // pointer changes whenever something mutates — that alone is normally
+    // enough. The content samples are a belt-and-braces guard for any
+    // future in-place mutation that happens to reuse the same allocation.
+    // O(1) and cheap.
+    struct DiagCacheFP {
+        const void* v_ptr = nullptr;
+        const void* f_ptr = nullptr;
+        std::size_t v_size = 0;
+        std::size_t f_size = 0;
+        double      v_first_x = 0.0, v_mid_x = 0.0, v_last_x = 0.0;
+        uint32_t    f_first_a = 0,   f_mid_a = 0,   f_last_a = 0;
+        static DiagCacheFP of(const Mesh& m) {
+            DiagCacheFP fp;
+            fp.v_ptr  = m.vertices.empty() ? nullptr
+                       : static_cast<const void*>(m.vertices.data());
+            fp.f_ptr  = m.faces.empty()    ? nullptr
+                       : static_cast<const void*>(m.faces.data());
+            fp.v_size = m.vertices.size();
+            fp.f_size = m.faces.size();
+            if (!m.vertices.empty()) {
+                fp.v_first_x = m.vertices.front()[0];
+                fp.v_last_x  = m.vertices.back()[0];
+                fp.v_mid_x   = m.vertices[fp.v_size / 2][0];
+            }
+            if (!m.faces.empty()) {
+                fp.f_first_a = m.faces.front()[0];
+                fp.f_last_a  = m.faces.back()[0];
+                fp.f_mid_a   = m.faces[fp.f_size / 2][0];
+            }
+            return fp;
+        }
+        bool operator==(const DiagCacheFP& o) const {
+            return v_ptr == o.v_ptr && f_ptr == o.f_ptr
+                && v_size == o.v_size && f_size == o.f_size
+                && v_first_x == o.v_first_x && v_mid_x == o.v_mid_x
+                && v_last_x == o.v_last_x
+                && f_first_a == o.f_first_a && f_mid_a == o.f_mid_a
+                && f_last_a == o.f_last_a;
+        }
+    };
+    struct DiagCache {
+        bool valid = false;
+        DiagCacheFP fp;
+        internal::MeshDiagnostics diag;
+        std::size_t hits = 0;
+        std::size_t misses = 0;
+    } result_diag_cache;
+    auto cached_diag = [&](const Mesh& m) -> const internal::MeshDiagnostics& {
+        auto cur = DiagCacheFP::of(m);
+        if (result_diag_cache.valid && result_diag_cache.fp == cur) {
+            ++result_diag_cache.hits;
+            return result_diag_cache.diag;
+        }
+        ++result_diag_cache.misses;
+        result_diag_cache.diag  = internal::compute_diagnostics(m);
+        result_diag_cache.fp    = cur;
+        result_diag_cache.valid = true;
+        return result_diag_cache.diag;
+    };
+    // Convenience wrapper for the common case. A typical pattern is:
+    //     auto post = compute_diagnostics(stage_result.mesh);
+    //     result.mesh = std::move(stage_result.mesh);
+    // After the move, result.mesh holds stage_result.mesh's underlying
+    // storage — same data() pointer, same fingerprint. So the NEXT pre-
+    // diag on result.mesh hits the cache for free. Routing both sides
+    // through cached_diag is what makes the move-then-pre-diag pattern
+    // a cache hit.
+    auto diag_of_result = [&]() -> const internal::MeshDiagnostics& {
+        return cached_diag(result.mesh);
+    };
+
     // --- Stage: weld ---
     if (opts.weld && !result.mesh.vertices.empty()) {
         internal::ScopedTimer t("weld", result.stage_times_ms);
@@ -274,7 +357,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
 
     // Early-exit for empty mesh.
     if (result.mesh.faces.empty()) {
-        auto diag = internal::compute_diagnostics(result.mesh);
+        auto diag = diag_of_result();
         result.component_count = diag.component_count;
         result.watertight = (diag.open_boundary_edges == 0 && diag.non_manifold_edges == 0);
         result.is_volume  = result.watertight && (diag.signed_volume > 0.0);
@@ -308,6 +391,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:phase5R");
     // --- Phase 5R: Classify connected components ---
     auto components = internal::classify_components(
         result.mesh,
@@ -452,9 +536,9 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 // topologically closed but geometrically degenerate, and
                 // should be treated as failures so the FWN+LevelSet
                 // fallback can take a swing.
-                auto has_real_volume = [](const Mesh& m) -> bool {
+                auto has_real_volume = [&](const Mesh& m) -> bool {
                     if (m.faces.empty() || m.vertices.empty()) return false;
-                    auto d = internal::compute_diagnostics(m);
+                    auto d = cached_diag(m);
                     double lo[3] = { m.vertices[0][0], m.vertices[0][1], m.vertices[0][2] };
                     double hi[3] = { lo[0], lo[1], lo[2] };
                     for (const auto& v : m.vertices) {
@@ -470,7 +554,9 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     return std::abs(d.signed_volume) > diag_cubed * 1e-6;
                 };
 
+                prof_lap("6R:pre-reconstruct_soup");
                 auto sr = stages::reconstruct_soup(soup_bag);
+                prof_lap("6R:post-reconstruct_soup");
 
                 bool sr_kept = false;
                 if (sr.was_needed && sr.success && has_real_volume(sr.mesh)) {
@@ -512,15 +598,52 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     // everywhere — for those, voxel-occupancy is orientation-
                     // agnostic and still finds enclosed pockets). Both
                     // paths share the manifold_to_welded_mesh post-treatment.
-                    auto fr = stages::fwn_levelset(soup_bag);
-                    if (!(fr.success && has_real_volume(fr.mesh))) {
+                    // FWN cost is O(F · grid_voxels). At the default
+                    // samples_per_axis=20 (8 000 query points), on a 435 k F
+                    // soup bag (UMODE_Ariel: 3821 fragmented shells
+                    // aggregated into one bag) that is 3.5 × 10⁹ atan2 ops
+                    // ≈ 150 s.
+                    //
+                    // We cannot just skip FWN on these inputs — voxel_levelset's
+                    // flood-fill leaks through the gaps between the 3821
+                    // shells and produces vol-0 garbage. FWN's winding-number
+                    // reconstruction is the only thing that actually works on
+                    // fragmented multi-shell soup. Instead, drop the grid
+                    // resolution adaptively so query_count × F stays bounded.
+                    //
+                    // Budget: ~5 × 10⁸ atan2 ops (~20 s). For F ≤ 60 000 the
+                    // default samples=20 (8 000 query points) fits the
+                    // budget unchanged. For larger F, cube-root of (budget/F)
+                    // gives the target. Floored at 8 (8³=512 query points
+                    // still produces ~1000-2000 MC faces; below that the
+                    // marching-cubes surface gets too blocky to be useful).
+                    int fwn_samples = 20;
+                    if (soup_bag.faces.size() > 60000) {
+                        const double budget = 5.0e8;
+                        const double f = static_cast<double>(soup_bag.faces.size());
+                        int s_int = static_cast<int>(std::cbrt(budget / f));
+                        if (s_int < 8)  s_int = 8;
+                        if (s_int > 20) s_int = 20;
+                        fwn_samples = s_int;
+                    }
+                    prof_lap("6R:pre-recon");
+                    auto fr = stages::fwn_levelset(soup_bag, fwn_samples);
+                    bool used_fwn = (fr.success && has_real_volume(fr.mesh));
+                    if (!used_fwn) {
                         fr = stages::voxel_levelset(soup_bag);
                     }
+                    prof_lap("6R:post-recon");
                     if (fr.success && has_real_volume(fr.mesh)) {
-                        add_stage("voxel_levelset");
-                        result.notes.push_back("voxel_levelset: reconstructed " +
+                        const char* reconstructor =
+                            used_fwn ? "fwn_levelset" : "voxel_levelset";
+                        add_stage(reconstructor);
+                        result.notes.push_back(std::string(reconstructor) +
+                            ": reconstructed " +
                             std::to_string(soup_face_total) + " soup faces -> " +
-                            std::to_string(fr.faces_out) + " marching-cubes faces");
+                            std::to_string(fr.faces_out) + " marching-cubes faces" +
+                            (fwn_samples != 20
+                                ? " (samples=" + std::to_string(fwn_samples) + ")"
+                                : std::string()));
                         dump("voxel_raw", fr.mesh);
                         // FWN output has float32-welded vertices but typically
                         // 50-100 genuine NM edges at marching-cubes pinch
@@ -561,6 +684,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:phase7R");
     // --- Phase 7R: OPEN queue → nm_edge → orient → fill_holes → CLOSED or PILE ---
     for (const auto& ci : components) {
         if (ci.cls != internal::ComponentClass::OPEN) continue;
@@ -574,7 +698,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         if (opts.orient)       { auto r = stages::orient_mesh(comp);            comp = std::move(r.mesh); }
         auto hr = stages::fill_holes(comp);
         comp = std::move(hr.mesh);
-        auto diag = internal::compute_diagnostics(comp);
+        auto diag = cached_diag(comp);
         if (diag.open_boundary_edges == 0) {
             if (hr.holes_filled > 0) {
                 add_stage("holes");
@@ -598,6 +722,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         closed_queue_preserve.push_back(true);  // closed input component, real user geometry
     }
 
+    prof_lap("pre:phase8R");
     // --- Phase 8R: CLOSED queue → orient → thin_features → nm_edge → MANIFOLD CLOSED or PILE ---
     // (manifold_closed_queue was declared earlier so FWN+LevelSet outputs can bypass Phase 8R)
 
@@ -629,7 +754,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         // fixtures but consistent regressions on intersections/spike_through
         // and similar complex-boundary cases. Net was a wash or slight loss
         // by Hausdorff median. Reverted in favour of Fix 1 alone.)
-        auto diag = internal::compute_diagnostics(comp);
+        auto diag = cached_diag(comp);
         if (diag.non_manifold_edges == 0 && diag.open_boundary_edges == 0) {
             manifold_closed_queue.push_back(std::move(comp));
         } else if (opts.soup_reconstruct) {
@@ -663,7 +788,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 result.notes.push_back("soup_reconstruct: reconstructed still-NM closed component");
                 Mesh r = std::move(sr.mesh);
                 if (opts.orient) { auto or3 = stages::orient_mesh(r); r = std::move(or3.mesh); }
-                auto d2 = internal::compute_diagnostics(r);
+                auto d2 = cached_diag(r);
                 if (d2.non_manifold_edges == 0 && d2.open_boundary_edges == 0) {
                     manifold_closed_queue.push_back(std::move(r));
                     any_manifold_ran = true;
@@ -694,6 +819,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:phase9R");
     // --- Phase 9R: Boolean Merge (MANIFOLD CLOSED queue) ---
     Mesh merged_solid;
     if (!manifold_closed_queue.empty()) {
@@ -708,11 +834,11 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             // manifold form (empirically: 0 NM → 100s of NM on
             // soup_seed* inputs at samples_per_axis ≥ 20).
             internal::ScopedTimer t("intersections", result.stage_times_ms);
-            auto pre_diag = internal::compute_diagnostics(merged_solid);
+            auto pre_diag = cached_diag(merged_solid);
             if (pre_diag.component_count > 1 || pre_diag.non_manifold_edges > 0) {
                 auto ir = stages::resolve_intersections(merged_solid);
                 if (!ir.manifold_failed) {
-                    auto post_diag = internal::compute_diagnostics(ir.mesh);
+                    auto post_diag = cached_diag(ir.mesh);
                     if (post_diag.non_manifold_edges <= pre_diag.non_manifold_edges) {
                         merged_solid = std::move(ir.mesh);
                         add_stage("intersections");
@@ -757,12 +883,14 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
 
     dump("post_shells", merged_solid);
 
+    prof_lap("pre:phase10R");
     // --- Phase 10R: Final Assembly ---
     if (!merged_solid.faces.empty()) {
         if (opts.orient)     { auto r = stages::orient_mesh(merged_solid);      merged_solid = std::move(r.mesh); }
         if (opts.degenerate) { auto r = stages::remove_degenerate(merged_solid); merged_solid = std::move(r.mesh); }
     }
 
+    prof_lap("pre:phase10R5");
     // --- Phase 10R.5: Pile reintegration via soup_reconstruct ---
     // Before appending the unrepairable pile raw, give it one more attempt
     // through the soup reconstruction pipeline (voxel oracle + T-T
@@ -867,6 +995,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     result.mesh = std::move(merged_solid);
     dump("post_pile", result.mesh);
 
+    prof_lap("pre:float32_compat");
     // --- Float32 compatibility pass ---
     // Manifold-based stages (intersections, soup_reconstruct) produce vertices
     // at double-precision positions that may not be exactly representable in
@@ -984,7 +1113,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     auto dr = stages::remove_degenerate(snapped, thresh);
                     snapped = std::move(dr.mesh);
                 }
-                auto snap_diag = internal::compute_diagnostics(snapped);
+                auto snap_diag = cached_diag(snapped);
                 if (snap_diag.non_manifold_edges == 0 && snap_diag.open_boundary_edges == 0) {
                     result.mesh = std::move(snapped);
                     break;
@@ -1044,6 +1173,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
 
     dump("post_float32", result.mesh);
 
+    prof_lap("pre:sliver");
     // --- Sliver collapse ---
     // Extreme-needle triangles (very low shape quality) — typically thin-strip
     // flap faces left by imperfect CSG self-intersection resolution — collapse
@@ -1055,11 +1185,11 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // re-evaluated; gated on non_manifold so it only fires when there's
     // something to fix.
     if (opts.non_manifold && !result.mesh.faces.empty()) {
-        auto pre_sl = internal::compute_diagnostics(result.mesh);
+        auto pre_sl = diag_of_result();
         if (pre_sl.non_manifold_edges > 0) {
             auto sl = stages::collapse_slivers(result.mesh);
             if (sl.slivers_collapsed > 0) {
-                auto post_sl = internal::compute_diagnostics(sl.mesh);
+                auto post_sl = cached_diag(sl.mesh);
                 // Keep only if total defect did not rise.
                 const int pre_d  = pre_sl.open_boundary_edges + pre_sl.non_manifold_edges;
                 const int post_d = post_sl.open_boundary_edges + post_sl.non_manifold_edges;
@@ -1073,6 +1203,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    prof_lap("pre:cleanup_loop");
     // --- Iterative topology cleanup (after float32 stabilisation) ---
     // The post-pipeline mesh, now float32-stable, may still have small
     // residual artifacts: NM edges from hole-fill fan-fan collisions, or
@@ -1100,7 +1231,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
 
     if (!result.mesh.faces.empty()) {
         for (int iter = 0; iter < 3; ++iter) {
-            auto pre = internal::compute_diagnostics(result.mesh);
+            auto pre = diag_of_result();
             if (pre.open_boundary_edges == 0 && pre.non_manifold_edges == 0) break;
             // Gate: enter the loop when there are NM edges to remove OR
             // when there's a SMALL pure-boundary residual (≤ 20 edges).
@@ -1170,7 +1301,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     auto dr = stages::remove_degenerate(result.mesh);
                     result.mesh = std::move(dr.mesh);
                 }
-                auto post_w = internal::compute_diagnostics(result.mesh);
+                auto post_w = diag_of_result();
                 if (post_w.open_boundary_edges < pre.open_boundary_edges &&
                     post_w.non_manifold_edges <= pre.non_manifold_edges) {
                     result.notes.push_back(
@@ -1198,14 +1329,14 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 result.mesh = std::move(r.mesh);
             }
             if (opts.holes) {
-                auto mid = internal::compute_diagnostics(result.mesh);
+                auto mid = diag_of_result();
                 if (mid.open_boundary_edges > 0) {
                     auto r = stages::fill_holes(result.mesh);
                     result.mesh = std::move(r.mesh);
                 }
             }
 
-            auto post = internal::compute_diagnostics(result.mesh);
+            auto post = diag_of_result();
             // Compare TOTAL defect count (boundary + non-manifold edges),
             // not each axis independently. The old per-axis rule treated
             // ANY increase in either axis as "worsened" — so an iteration
@@ -1245,11 +1376,11 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // 2-to-1 and closes the slit with no degenerate faces. Guarded on total
     // defect (bnd+nm) so a mis-split cannot worsen the mesh.
     if (opts.holes && !result.mesh.faces.empty()) {
-        auto pre = internal::compute_diagnostics(result.mesh);
+        auto pre = diag_of_result();
         if (pre.open_boundary_edges > 0 || pre.non_manifold_edges > 0) {
             auto tj = stages::split_tjunctions(result.mesh);
             if (tj.edges_split > 0) {
-                auto post = internal::compute_diagnostics(tj.mesh);
+                auto post = cached_diag(tj.mesh);
                 const int pre_d  = static_cast<int>(pre.open_boundary_edges) +
                                    static_cast<int>(pre.non_manifold_edges);
                 const int post_d = static_cast<int>(post.open_boundary_edges) +
@@ -1319,13 +1450,13 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             }
             result.mesh = std::move(welded);
         }
-        auto defect_of = [](const Mesh& m) {
-            auto d = internal::compute_diagnostics(m);
+        auto defect_of = [&](const Mesh& m) {
+            auto d = cached_diag(m);
             return static_cast<int>(d.open_boundary_edges) +
                    static_cast<int>(d.non_manifold_edges);
         };
         for (int iter = 0; iter < 6; ++iter) {
-            auto pre_p = internal::compute_diagnostics(result.mesh);
+            auto pre_p = diag_of_result();
             if (pre_p.non_manifold_edges == 0) break;
             const int pre_d = static_cast<int>(pre_p.open_boundary_edges) +
                               static_cast<int>(pre_p.non_manifold_edges);
@@ -1379,7 +1510,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // an internal degenerate pocket is removed. Self-guarding: nm_after is
     // always ≤ nm_before, so it is kept whenever it strictly improved.
     if (opts.non_manifold && !result.mesh.faces.empty()) {
-        auto pre = internal::compute_diagnostics(result.mesh);
+        auto pre = diag_of_result();
         if (pre.non_manifold_edges > 0) {
             auto cr = stages::collapse_nm_region(result.mesh);
             if (cr.applied && cr.nm_after < cr.nm_before) {
@@ -1387,7 +1518,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 // pocket must barely move the signed volume. A large swing
                 // means the collapses chewed into real geometry (e.g. welding
                 // a thin wall) — reject the whole stage in that case.
-                auto post = internal::compute_diagnostics(cr.mesh);
+                auto post = cached_diag(cr.mesh);
                 double v0 = std::abs(pre.signed_volume);
                 double dv = std::abs(post.signed_volume - pre.signed_volume);
                 if (v0 < 1e-300 || dv <= 0.005 * v0) {
@@ -1413,13 +1544,13 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // close it — the geometry collapse_nm produces is simpler and more
     // amenable to small-ring patching. Same ring-retry + total-defect guard.
     if (opts.holes && opts.non_manifold && !result.mesh.faces.empty()) {
-        auto defect_now = [](const Mesh& m) {
-            auto d = internal::compute_diagnostics(m);
+        auto defect_now = [&](const Mesh& m) {
+            auto d = cached_diag(m);
             return static_cast<int>(d.open_boundary_edges) +
                    static_cast<int>(d.non_manifold_edges);
         };
         for (int iter = 0; iter < 3; ++iter) {
-            auto pre_p = internal::compute_diagnostics(result.mesh);
+            auto pre_p = diag_of_result();
             if (pre_p.non_manifold_edges == 0) break;
             const int pre_d = static_cast<int>(pre_p.open_boundary_edges) +
                               static_cast<int>(pre_p.non_manifold_edges);
@@ -1460,19 +1591,19 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     //      pairs.
     // Whole-stage guard: total defect (bnd+nm) must strictly improve AND
     // signed volume must move ≤0.5% — same envelope as collapse_nm.
-    auto _defect_local = [](const Mesh& m) {
-        auto d = internal::compute_diagnostics(m);
+    auto _defect_local = [&](const Mesh& m) {
+        auto d = cached_diag(m);
         return static_cast<int>(d.open_boundary_edges) +
                static_cast<int>(d.non_manifold_edges);
     };
     if (!result.mesh.faces.empty()) {
         auto pre_d = _defect_local(result.mesh);
         if (pre_d > 0) {
-            auto pre = internal::compute_diagnostics(result.mesh);
+            auto pre = diag_of_result();
             auto nr = stages::nm_local_repair(result.mesh);
             if (nr.merges > 0 || nr.pairs_removed > 0) {
                 auto post_d = _defect_local(nr.mesh);
-                auto post = internal::compute_diagnostics(nr.mesh);
+                auto post = cached_diag(nr.mesh);
                 const double v0 = std::abs(pre.signed_volume);
                 const double dv = std::abs(post.signed_volume - pre.signed_volume);
                 if (post_d < pre_d && (v0 < 1e-300 || dv <= 0.005 * v0)) {
@@ -1492,8 +1623,8 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     prof_lap("pre:late_thin");
     // --- Late back-to-back duplicate-face removal (centroid+normal) ---
     // Catches back-to-back pairs introduced by
-    auto _defect = [](const Mesh& m) {
-        auto d = internal::compute_diagnostics(m);
+    auto _defect = [&](const Mesh& m) {
+        auto d = cached_diag(m);
         return static_cast<int>(d.open_boundary_edges) +
                static_cast<int>(d.non_manifold_edges);
     };
@@ -1740,7 +1871,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             }
             probe = std::move(welded);
         }
-        auto pre = internal::compute_diagnostics(probe);
+        auto pre = cached_diag(probe);
         // Carve+refill is the right tool for SMALL residual NM (1-10 ish):
         // the carve is local, the Liepa refill knits a clean patch, the
         // recursive repair settles it. For LARGE residuals (kytka1: nm=101
@@ -1763,7 +1894,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 nested.recursion_depth   = opts.recursion_depth + 1;
                 nested.allow_carve_refill = false;   // no further recursion
                 RepairResult inner = repair(cr.mesh, nested);
-                auto post = internal::compute_diagnostics(inner.mesh);
+                auto post = cached_diag(inner.mesh);
                 const double v0 = std::abs(pre.signed_volume);
                 const double dv = std::abs(post.signed_volume - pre.signed_volume);
                 // Volume guard: reject a recursion that DESTROYED the model
@@ -1875,7 +2006,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 if (a != b && b != c && a != c) probe.faces.push_back({a, b, c});
             }
         }
-        auto cur = internal::compute_diagnostics(probe);
+        auto cur = cached_diag(probe);
         const bool not_clean = cur.open_boundary_edges > 0 ||
                                cur.non_manifold_edges > 0;
         // Genuinely-destroyed pre-gate: only reconstruct when the pipeline
@@ -1895,14 +2026,14 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 // them with the same guarded edge-collapse used elsewhere so
                 // the reconstruction is a clean watertight solid.
                 {
-                    auto vd0 = internal::compute_diagnostics(vr.mesh);
+                    auto vd0 = cached_diag(vr.mesh);
                     if (vd0.non_manifold_edges > 0) {
                         auto vc = stages::collapse_nm_region(vr.mesh);
                         if (vc.applied && vc.nm_after < vc.nm_before)
                             vr.mesh = std::move(vc.mesh);
                     }
                 }
-                auto vd = internal::compute_diagnostics(vr.mesh);
+                auto vd = cached_diag(vr.mesh);
                 const bool vox_clean = vd.open_boundary_edges == 0 &&
                                        vd.non_manifold_edges == 0;
                 const double cur_vol = std::abs(cur.signed_volume);
@@ -1932,7 +2063,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // meshseal currently turns non-clean and we want to keep.
     if (input_was_clean && !result.mesh.faces.empty()) {
         auto probe = float32_weld(result.mesh);
-        auto pd = internal::compute_diagnostics(probe);
+        auto pd = cached_diag(probe);
         if (pd.open_boundary_edges > 0 || pd.non_manifold_edges > 0) {
             result.mesh = input_welded;
             add_stage("input_restored");
@@ -1943,6 +2074,10 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     }
 
     prof_lap("pre:final_diag");
+    if (prof_env) {
+        std::fprintf(stderr, "[prof] diag_cache hits=%zu misses=%zu\n",
+                     result_diag_cache.hits, result_diag_cache.misses);
+    }
     dump("final", result.mesh);
 
     // --- Final diagnostics ---
@@ -1950,7 +2085,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     double final_bbox_diag_sq = 0.0;
     {
         internal::ScopedTimer t("diagnostics", result.stage_times_ms);
-        auto diag = internal::compute_diagnostics(result.mesh);
+        auto diag = diag_of_result();
         result.component_count = diag.component_count;
         result.watertight  = (diag.open_boundary_edges == 0 &&
                               diag.non_manifold_edges == 0);
