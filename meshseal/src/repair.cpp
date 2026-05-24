@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <manifold/manifold.h>
 
 namespace meshseal {
@@ -2187,6 +2188,134 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    // --- Late fill_holes: catch small boundary residuals from collapse_nm ---
+    // Some inputs end up with nm=0 and a small boundary residual after the
+    // late stages — typically collapse_nm closes a fold but opens a few
+    // boundary edges where the collapsed flap previously connected. The
+    // cleanup_loop runs BEFORE T-junction/nm_patch/collapse_nm so doesn't
+    // see this state, and nm_patch_2nd gates on nm>0 so skips it. Single
+    // unconditional fill_holes pass when nm=0 and bnd is small-to-moderate.
+    // test.stl (panda): collapse_nm 61->0 nm but left bnd=4; this catches
+    // it. Total-defect guard ensures we don't worsen.
+    if (opts.holes && opts.non_manifold && !result.mesh.faces.empty()) {
+        auto pre_fh = cached_diag(result.mesh);
+        if (prof_env) std::fprintf(stderr, "[lfh] pre nm=%d bnd=%d\n",
+            pre_fh.non_manifold_edges, pre_fh.open_boundary_edges);
+        if (pre_fh.non_manifold_edges == 0 &&
+            pre_fh.open_boundary_edges > 0 &&
+            pre_fh.open_boundary_edges <= 100) {
+            // Target: distance-0 duplicate vertices on boundary edges
+            // (left as separate indices by earlier stages — nm_vertex
+            // split + partial collapse, etc.). On test.stl (panda)
+            // bnd=4 is a "T" between 2 distinct positions where one
+            // appears twice as different indices; merging the dup
+            // collapses the phantom boundary to manifold edges. A
+            // tolerance-weld (even bbox·1e-9) over-merges on dense
+            // meshes — instead identify exact-position duplicates
+            // among ONLY the boundary vertices.
+            std::unordered_map<uint64_t, int> ecnt;
+            ecnt.reserve(result.mesh.faces.size() * 2);
+            auto ekey = [](uint32_t a, uint32_t b) {
+                if (a > b) std::swap(a, b);
+                return (static_cast<uint64_t>(a) << 32) | b;
+            };
+            for (const auto& f : result.mesh.faces)
+                for (int k = 0; k < 3; ++k)
+                    ++ecnt[ekey(f[k], f[(k+1)%3])];
+            std::unordered_set<uint32_t> bvs;
+            for (const auto& kv : ecnt) {
+                if (kv.second != 1) continue;
+                bvs.insert(static_cast<uint32_t>(kv.first >> 32));
+                bvs.insert(static_cast<uint32_t>(kv.first & 0xffffffffu));
+            }
+            const auto& V = result.mesh.vertices;
+            // Within-tolerance match on boundary vertices ONLY. The
+            // duplicates left by earlier stages can differ by ~1 float32
+            // ULP at bbox scale (test.stl panda: 4.77e-7 in one coord —
+            // two adjacent float32 values, NOT bit-equal). A whole-mesh
+            // tolerance weld over-merges; limiting to the small boundary
+            // vertex set is safe (only verts already on the open boundary
+            // can fuse). Use a coarse cell hash (cell = 2 × tol) plus a
+            // precise distance check.
+            double lo[3] = {V[0][0], V[0][1], V[0][2]};
+            double hi[3] = {lo[0], lo[1], lo[2]};
+            for (const auto& vv : V)
+                for (int k = 0; k < 3; ++k) {
+                    if (vv[k] < lo[k]) lo[k] = vv[k];
+                    if (vv[k] > hi[k]) hi[k] = vv[k];
+                }
+            const double dx_ = hi[0]-lo[0], dy_ = hi[1]-lo[1], dz_ = hi[2]-lo[2];
+            const double diag_w = std::sqrt(dx_*dx_ + dy_*dy_ + dz_*dz_);
+            const double tol  = diag_w * 2e-7;    // ~2 float32 ULPs at bbox
+            const double tol2 = tol * tol;
+            const double cell = tol * 2.0;
+            auto qhash = [&](double x, double y, double z) -> uint64_t {
+                int64_t ix = static_cast<int64_t>(std::floor(x / cell));
+                int64_t iy = static_cast<int64_t>(std::floor(y / cell));
+                int64_t iz = static_cast<int64_t>(std::floor(z / cell));
+                return static_cast<uint64_t>(ix) * 73856093ULL ^
+                       static_cast<uint64_t>(iy) * 19349663ULL ^
+                       static_cast<uint64_t>(iz) * 83492791ULL;
+            };
+            std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
+            for (uint32_t bv : bvs)
+                grid[qhash(V[bv][0], V[bv][1], V[bv][2])].push_back(bv);
+            std::vector<uint32_t> remap(V.size());
+            for (uint32_t i = 0; i < V.size(); ++i) remap[i] = i;
+            int merged = 0;
+            for (uint32_t bv : bvs) {
+                if (remap[bv] != bv) continue;       // already merged
+                const auto& p = V[bv];
+                const int64_t ix0 = static_cast<int64_t>(std::floor(p[0]/cell));
+                const int64_t iy0 = static_cast<int64_t>(std::floor(p[1]/cell));
+                const int64_t iz0 = static_cast<int64_t>(std::floor(p[2]/cell));
+                for (int di = -1; di <= 1; ++di)
+                for (int dj = -1; dj <= 1; ++dj)
+                for (int dk = -1; dk <= 1; ++dk) {
+                    int64_t kx = ix0+di, ky = iy0+dj, kz = iz0+dk;
+                    uint64_t k = static_cast<uint64_t>(kx) * 73856093ULL ^
+                                 static_cast<uint64_t>(ky) * 19349663ULL ^
+                                 static_cast<uint64_t>(kz) * 83492791ULL;
+                    auto it = grid.find(k);
+                    if (it == grid.end()) continue;
+                    for (uint32_t ov : it->second) {
+                        if (ov <= bv) continue;        // first occurrence wins
+                        if (remap[ov] != ov) continue;
+                        const auto& q = V[ov];
+                        const double ex = p[0]-q[0], ey = p[1]-q[1], ez = p[2]-q[2];
+                        if (ex*ex + ey*ey + ez*ez <= tol2) {
+                            remap[ov] = bv;
+                            ++merged;
+                        }
+                    }
+                }
+            }
+            if (merged > 0) {
+                Mesh out;
+                out.vertices = V;
+                out.faces.reserve(result.mesh.faces.size());
+                for (const auto& f : result.mesh.faces) {
+                    uint32_t a = remap[f[0]], b = remap[f[1]], c = remap[f[2]];
+                    if (a != b && b != c && a != c)
+                        out.faces.push_back({a, b, c});
+                }
+                auto post = cached_diag(out);
+                if (post.open_boundary_edges < pre_fh.open_boundary_edges &&
+                    post.non_manifold_edges <= pre_fh.non_manifold_edges) {
+                    add_stage("late_fill_holes");
+                    result.notes.push_back("late_fill_holes: merged " +
+                        std::to_string(merged) +
+                        " distance-0 boundary-vertex duplicate(s) "
+                        "(bnd " +
+                        std::to_string(pre_fh.open_boundary_edges) +
+                        " -> " +
+                        std::to_string(post.open_boundary_edges) + ")");
+                    result.mesh = std::move(out);
+                }
+            }
+        }
+    }
+
     // --- Coplanar 4-fan resolver ---
     // Drops "duplicate layer" face pairs from same-sided coplanar 4-fans
     // around NM edges (typical of multi-color 3MF exports and coplanar
@@ -2209,9 +2338,27 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             // settles the result properly. Same pattern as
             // nm_carve_refill's recursive re-entry.
             auto pre = cached_diag(result.mesh);
+            // Limited-stage cleanup: the recursion's job is just to close
+            // the boundary edges opened by the drop. Disable the heavy
+            // geometry-reshaping stages:
+            //   - intersections (Phase 9R manifold self-union) — would
+            //     re-weld shells and pick a smaller solid
+            //   - shells (the volume-based shell filter) — would drop
+            //     overlapping shells we want to keep
+            //   - soup_reconstruct (Phase 6R + Phase 10R.5 + destruction_fb)
+            //     — would replace original geometry with MC remesh
+            // Keep: weld, degenerate, orient, nm_vertex, nm_edge, holes
+            // (which includes fill_holes), the post-cleanup loop,
+            // T-junction, nm_patch_remesh, collapse_nm, nm_local_repair,
+            // late_thin, junk_drop. That set is enough to close holes
+            // and clean residual NM without reshaping the volume.
             RepairOptions nested = opts;
-            nested.recursion_depth   = opts.recursion_depth + 1;
+            nested.recursion_depth    = opts.recursion_depth + 1;
             nested.allow_carve_refill = false;   // no further recursion
+            nested.allow_spatial_split = false;  // not for sub-cleanup
+            nested.intersections      = false;
+            nested.shells             = false;
+            nested.soup_reconstruct   = false;
             RepairResult inner = repair(cfd.mesh, nested);
             auto post = cached_diag(inner.mesh);
             const int pre_d  = static_cast<int>(pre.open_boundary_edges) +
@@ -2239,7 +2386,15 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             const bool vol_ok = (v0 < 1e-300) ||
                                 (dv <= 0.05 * v0) ||
                                 (bbv > 0.0 && dv <= 0.005 * bbv);
-            if (post_d < pre_d && vol_ok) {
+            // Adopt only when the cfd recursion produces a STRICTLY
+            // CLEAN result (post_d == 0). Partial improvement was
+            // observed to block front_7color's subsequent nm_carve_refill
+            // iter loop from finishing the job (6 -> 1 -> 0); the
+            // intermediate cfd-touched state caused different decisions
+            // downstream and the carve loop stalled at nm=2. Strict-only
+            // keeps the celo / future cfd-target rescues without
+            // disturbing the cases the rest of the pipeline can finish.
+            if (post_d == 0 && pre_d > 0 && vol_ok) {
                 add_stage("coplanar_fan_drop");
                 result.notes.push_back("coplanar_fan_drop: dropped " +
                     std::to_string(cfd.fans_dropped) +
