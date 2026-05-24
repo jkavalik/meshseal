@@ -22,12 +22,14 @@
 #include "stages/alpha_wrap.h"
 #include "stages/nm_local_repair.h"
 #include "stages/nm_carve_refill.h"
+#include "stages/coplanar_fan_drop.h"
 #include "stl_io.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <unordered_map>
 #include <manifold/manifold.h>
 
@@ -258,6 +260,32 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         return cached_diag(result.mesh);
     };
 
+    // --- Per-stage face-count caps for huge meshes ---
+    //
+    // Two manifold-CSG-based stages hang on huge inputs because
+    // manifold::Manifold construction is super-linear in F (BVH build +
+    // edge welding + decomposition). Cap them so huge meshes don't spend
+    // hundreds of seconds in libraries we don't control.
+    //
+    //   reconstruct_soup (Phase 8R closed-queue + Phase 10R.5 pile):
+    //     800 k F. On 1 M+ F real-input components the rebuild output
+    //     usually gets rejected by the existing 10 % catastrophic-collapse
+    //     guard anyway, so we just save the wasted work. Corpus largest
+    //     closed-queue component is lobster ~124 k F — well below.
+    //
+    //   intersections (Phase 9R Boolean self-union): 1.2 M F. With the
+    //     AABB-disjoint pre-check (provably a no-op for disjoint shells)
+    //     this only fires for AABB-overlapping huge inputs — a real loss
+    //     but no alternative within manifold's CSG.
+    //
+    // T-junction, cleanup_loop, nm_patch_remesh, nm_local_repair, late_thin
+    // etc. are O(F) or worse but DO USEFUL WORK on huge meshes (cleanup_loop
+    // on Groot's 2 M F: 47 s to close all 186 boundary edges; net output
+    // CLEAN vs the cap-skipped output's bnd=186). No caps for those — pay
+    // the time, get clean output.
+    constexpr size_t kReconstructSoupMaxFaces = 800000;
+    constexpr size_t kHugeCleanupMaxFaces     = 1200000;
+
     // --- Stage: weld ---
     if (opts.weld && !result.mesh.vertices.empty()) {
         internal::ScopedTimer t("weld", result.stage_times_ms);
@@ -283,6 +311,172 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             result.notes.push_back("degenerate: removed " + std::to_string(dr.isolated_vertices_removed) + " isolated vertices");
     }
 
+    // --- Spatial cluster split (multi-object STL dispatcher) ---
+    //
+    // If the welded input decomposes into multiple AABB-disjoint clusters of
+    // connected components — the signature of a multi-object STL (several
+    // independent objects exported on one print plate) — recurse per-cluster.
+    // Each cluster runs the full pipeline at its own bbox scale, which is
+    // the meaningful win for stages whose cost or quality scales with the
+    // input bbox: alpha_wrap's voxel grid is now sized per-cluster instead
+    // of having to resolve every cluster inside one whole-plate grid.
+    //
+    // Mathematical safety: AABB-disjoint shells have zero geometric coupling.
+    // The manifold-union of disjoint manifolds is concatenation, so
+    // per-cluster intersections produces the same NM as the whole-mesh path.
+    // No corpus regression risk: the corpus is mostly single-object meshes
+    // and falls through this gate at near-zero cost.
+    //
+    // Gates: opts.allow_spatial_split (off in the recursive call), and a
+    // minimum-cluster count of 2 (one cluster = nothing to split). The
+    // recursive call gets allow_spatial_split = false to avoid re-entry.
+    if (opts.allow_spatial_split && result.mesh.faces.size() > 64) {
+        auto comps = internal::classify_components(
+            result.mesh,
+            opts.soup_planarity_threshold,
+            opts.soup_open_ratio_threshold);
+        if (comps.size() >= 2) {
+            // Per-component AABBs (over only the vertices that component
+            // references, so a junk shard far from the main body lands in
+            // its own cluster correctly).
+            struct AABB { double lo[3]; double hi[3]; };
+            std::vector<AABB> bb(comps.size());
+            for (size_t ci = 0; ci < comps.size(); ++ci) {
+                AABB& b = bb[ci];
+                for (int k = 0; k < 3; ++k) { b.lo[k] =  1e300; b.hi[k] = -1e300; }
+                for (uint32_t fi : comps[ci].face_indices) {
+                    const auto& f = result.mesh.faces[fi];
+                    for (int v = 0; v < 3; ++v) {
+                        const auto& p = result.mesh.vertices[f[v]];
+                        for (int k = 0; k < 3; ++k) {
+                            if (p[k] < b.lo[k]) b.lo[k] = p[k];
+                            if (p[k] > b.hi[k]) b.hi[k] = p[k];
+                        }
+                    }
+                }
+            }
+            // Global bbox for padding scale.
+            double gbb_lo[3] = { bb[0].lo[0], bb[0].lo[1], bb[0].lo[2] };
+            double gbb_hi[3] = { bb[0].hi[0], bb[0].hi[1], bb[0].hi[2] };
+            for (size_t ci = 1; ci < bb.size(); ++ci)
+                for (int k = 0; k < 3; ++k) {
+                    if (bb[ci].lo[k] < gbb_lo[k]) gbb_lo[k] = bb[ci].lo[k];
+                    if (bb[ci].hi[k] > gbb_hi[k]) gbb_hi[k] = bb[ci].hi[k];
+                }
+            const double gext = std::sqrt(
+                (gbb_hi[0]-gbb_lo[0])*(gbb_hi[0]-gbb_lo[0]) +
+                (gbb_hi[1]-gbb_lo[1])*(gbb_hi[1]-gbb_lo[1]) +
+                (gbb_hi[2]-gbb_lo[2])*(gbb_hi[2]-gbb_lo[2]));
+            // Padding: 0.1 % of global bbox diagonal. Tight enough that
+            // truly separate objects stay separate, loose enough that
+            // shells touching at a single edge / vertex still merge into
+            // one cluster (typical CSG-style input — petals + stem of a
+            // flower in kytka1).
+            const double pad = gext * 1e-3;
+            // Union-Find by AABB overlap-with-padding.
+            std::vector<size_t> uf(comps.size());
+            for (size_t i = 0; i < uf.size(); ++i) uf[i] = i;
+            std::function<size_t(size_t)> find_root = [&](size_t i) -> size_t {
+                while (uf[i] != i) { uf[i] = uf[uf[i]]; i = uf[i]; }
+                return i;
+            };
+            auto aabb_overlap = [&](const AABB& a, const AABB& b2) {
+                for (int k = 0; k < 3; ++k) {
+                    if (a.hi[k] + pad < b2.lo[k]) return false;
+                    if (b2.hi[k] + pad < a.lo[k]) return false;
+                }
+                return true;
+            };
+            for (size_t i = 0; i < bb.size(); ++i)
+                for (size_t j = i + 1; j < bb.size(); ++j)
+                    if (aabb_overlap(bb[i], bb[j])) {
+                        size_t ri = find_root(i), rj = find_root(j);
+                        if (ri != rj) uf[ri] = rj;
+                    }
+            // Group components by root.
+            std::unordered_map<size_t, std::vector<size_t>> clusters;
+            for (size_t i = 0; i < uf.size(); ++i)
+                clusters[find_root(i)].push_back(i);
+            // Size-aware split gate:
+            //   - ≥ 3 clusters: always split (multi-object plate inputs:
+            //     Marble 15 → 3 clusters, kytka1 22 → 7 — the perf and
+            //     alpha_wrap-quality wins outweigh per-cluster divergence)
+            //   - ≥ 2 clusters AND F > 1 M: split anyway (huge meshes,
+            //     where the alternative is Phase 9R intersections taking
+            //     hundreds of seconds — Groot_v1_1M_Merged at 2 M F
+            //     spends 424 s in manifold construction without the split)
+            //   - 2 clusters AND F ≤ 1 M: do NOT split. Main_Body_parts
+            //     (271 k F, 2 AABB-disjoint components) leaves nm=5
+            //     residual under per-cluster processing where the
+            //     whole-mesh path gets nm=0 — small per-stage cascades.
+            //     The dual-scale volume guards on collapse_nm /
+            //     nm_local_repair close most of that gap but not all.
+            const bool many_clusters = clusters.size() >= 3;
+            const bool huge_mesh_2cluster = (clusters.size() >= 2 &&
+                                             result.mesh.faces.size() > 1000000);
+            if (many_clusters || huge_mesh_2cluster) {
+                if (prof_env)
+                    std::fprintf(stderr,
+                        "[prof] spatial_split: %zu components -> %zu clusters\n",
+                        comps.size(), clusters.size());
+                // Extract each cluster as a sub-mesh, recurse, and combine.
+                RepairOptions sub_opts = opts;
+                sub_opts.allow_spatial_split = false;
+                std::vector<Mesh> sub_meshes;
+                bool   all_watertight = true;
+                bool   all_volume     = true;
+                int    total_components = 0;
+                int    total_si       = 0;
+                bool   any_si_unknown = false;
+                bool   any_partial    = false;
+                double min_confidence = 1.0;
+                size_t sub_idx = 0;
+                for (auto& kv : clusters) {
+                    std::vector<uint32_t> face_idx;
+                    for (size_t ci : kv.second)
+                        face_idx.insert(face_idx.end(),
+                            comps[ci].face_indices.begin(),
+                            comps[ci].face_indices.end());
+                    Mesh sub = internal::extract_component(result.mesh, face_idx);
+                    auto sub_res = repair(sub, sub_opts);
+                    if (!sub_res.mesh.faces.empty())
+                        sub_meshes.push_back(std::move(sub_res.mesh));
+                    if (!sub_res.watertight) all_watertight = false;
+                    if (!sub_res.is_volume)  all_volume     = false;
+                    total_components += sub_res.component_count;
+                    if (sub_res.self_intersections < 0) any_si_unknown = true;
+                    else                                 total_si += sub_res.self_intersections;
+                    if (sub_res.partial_failure) any_partial = true;
+                    if (sub_res.confidence < min_confidence)
+                        min_confidence = sub_res.confidence;
+                    for (const auto& s : sub_res.stages_applied)
+                        if (std::find(result.stages_applied.begin(),
+                                      result.stages_applied.end(), s) ==
+                            result.stages_applied.end())
+                            result.stages_applied.push_back(s);
+                    for (const auto& n : sub_res.notes)
+                        result.notes.push_back(
+                            "[cluster " + std::to_string(sub_idx) + "] " + n);
+                    ++sub_idx;
+                }
+                result.mesh = internal::merge_meshes(sub_meshes);
+                result.notes.push_back("spatial_split: " +
+                    std::to_string(comps.size()) + " input components -> " +
+                    std::to_string(clusters.size()) + " AABB-disjoint clusters, "
+                    "repaired independently");
+                result.watertight        = all_watertight;
+                result.is_volume         = all_volume;
+                result.component_count   = total_components;
+                result.self_intersections = any_si_unknown ? -1 : total_si;
+                result.partial_failure   = any_partial;
+                result.confidence        = min_confidence;
+                // Skip the rest of the pipeline — sub-clusters already ran it.
+                return result;
+            }
+        }
+    }
+
+    prof_lap("pre:orient");
     // --- Stage: orient ---
     if (opts.orient && !result.mesh.faces.empty()) {
         internal::ScopedTimer t("orient", result.stage_times_ms);
@@ -297,6 +491,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             result.notes.push_back("orient: mesh has non-orientable regions (skipped BFS propagation)");
     }
 
+    prof_lap("pre:nm_vertex");
     // --- Stage: nm_vertex ---
     if (opts.non_manifold && !result.mesh.faces.empty()) {
         internal::ScopedTimer t("nm_vertex", result.stage_times_ms);
@@ -308,6 +503,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                                    " non-manifold vertices (" + std::to_string(nmv.vertices_added) + " vertices added)");
     }
 
+    prof_lap("pre:nm_edge");
     // --- Stage: nm_edge ---
     if (opts.non_manifold && !result.mesh.faces.empty()) {
         internal::ScopedTimer t("nm_edge", result.stage_times_ms);
@@ -364,6 +560,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         return result;
     }
 
+    prof_lap("pre:bridge_loops");
     // --- Cross-shell boundary-loop bridging ---
     // A topological opening shared by two shells — e.g. a head shell with a
     // mouth hole and a separate mouth-cavity shell with its own opening
@@ -781,7 +978,24 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             const size_t in_faces = comp.faces.size();
             const bool   guard_active = preserve_original && (in_faces >= 1000);
             const size_t min_keep = guard_active ? in_faces / 10 : 0;
-            auto sr = stages::reconstruct_soup(comp);
+            // Size cap on reconstruct_soup. On a still-NM closed
+            // component of 1 M+ F (Groot_v1_1M_Merged has two ~1 M F
+            // components), reconstruct_soup runs a voxel-oracle + the
+            // legacy manifold-based CSG rebuild; the manifold construction
+            // alone takes hundreds of seconds. The result for huge real-
+            // input components is almost always rejected anyway (the
+            // 10 %-of-input min_keep guard catches catastrophic collapse).
+            // Skip the call directly: route to pile, let pile reintegration
+            // or the destruction-fallback alpha_wrap take over. The cap
+            // (800 k F) is well above all corpus closed-queue components
+            // (largest corpus fixture is lobster ~124 k F).
+            stages::SoupResult sr;
+            if (in_faces > kReconstructSoupMaxFaces) {
+                sr.was_needed = true;
+                sr.success    = false;
+            } else {
+                sr = stages::reconstruct_soup(comp);
+            }
             bool ok = false;
             if (sr.was_needed && sr.success && sr.mesh.faces.size() >= min_keep) {
                 add_stage("soup_reconstruct");
@@ -835,7 +1049,82 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             // soup_seed* inputs at samples_per_axis ≥ 20).
             internal::ScopedTimer t("intersections", result.stage_times_ms);
             auto pre_diag = cached_diag(merged_solid);
-            if (pre_diag.component_count > 1 || pre_diag.non_manifold_edges > 0) {
+            // AABB-disjoint pre-check: if all merged_solid components are
+            // pairwise AABB-disjoint with a small padding, the manifold
+            // self-union is provably a no-op (Boolean union of disjoint
+            // manifolds is just concatenation). Skip the heavyweight
+            // manifold construction entirely — this is a mathematical
+            // identity, not a heuristic. Cheap to check (O(C²) AABB pairs
+            // where C = component count).
+            bool aabb_disjoint = false;
+            if (pre_diag.component_count > 1) {
+                auto subs = internal::classify_components(merged_solid,
+                    opts.soup_planarity_threshold,
+                    opts.soup_open_ratio_threshold);
+                if (subs.size() == static_cast<size_t>(pre_diag.component_count) &&
+                    subs.size() >= 2 && subs.size() <= 256) {
+                    struct AB { double lo[3], hi[3]; };
+                    std::vector<AB> abb(subs.size());
+                    for (size_t i = 0; i < subs.size(); ++i) {
+                        AB& b = abb[i];
+                        for (int k = 0; k < 3; ++k) { b.lo[k]= 1e300; b.hi[k]=-1e300; }
+                        for (uint32_t fi : subs[i].face_indices) {
+                            const auto& f = merged_solid.faces[fi];
+                            for (int v = 0; v < 3; ++v) {
+                                const auto& p = merged_solid.vertices[f[v]];
+                                for (int k = 0; k < 3; ++k) {
+                                    if (p[k] < b.lo[k]) b.lo[k] = p[k];
+                                    if (p[k] > b.hi[k]) b.hi[k] = p[k];
+                                }
+                            }
+                        }
+                    }
+                    // Global extent for a tiny padding.
+                    double glo[3] = { abb[0].lo[0], abb[0].lo[1], abb[0].lo[2] };
+                    double ghi[3] = { abb[0].hi[0], abb[0].hi[1], abb[0].hi[2] };
+                    for (size_t i = 1; i < abb.size(); ++i)
+                        for (int k = 0; k < 3; ++k) {
+                            if (abb[i].lo[k] < glo[k]) glo[k] = abb[i].lo[k];
+                            if (abb[i].hi[k] > ghi[k]) ghi[k] = abb[i].hi[k];
+                        }
+                    const double gext = std::sqrt(
+                        (ghi[0]-glo[0])*(ghi[0]-glo[0]) +
+                        (ghi[1]-glo[1])*(ghi[1]-glo[1]) +
+                        (ghi[2]-glo[2])*(ghi[2]-glo[2]));
+                    const double pad = gext * 1e-6;
+                    aabb_disjoint = true;
+                    for (size_t i = 0; i < abb.size() && aabb_disjoint; ++i)
+                        for (size_t j = i+1; j < abb.size() && aabb_disjoint; ++j) {
+                            bool overlap = true;
+                            for (int k = 0; k < 3; ++k) {
+                                if (abb[i].hi[k] + pad < abb[j].lo[k]) { overlap = false; break; }
+                                if (abb[j].hi[k] + pad < abb[i].lo[k]) { overlap = false; break; }
+                            }
+                            if (overlap) aabb_disjoint = false;
+                        }
+                }
+                if (aabb_disjoint) {
+                    result.notes.push_back("intersections: skipped (all " +
+                        std::to_string(pre_diag.component_count) +
+                        " merged components are AABB-disjoint; union is a "
+                        "no-op)");
+                }
+            }
+            // Skip for huge meshes (cf. Groot_v1_1M_Merged — 424 s in
+            // manifold construction at 2 M F). Trade-off: huge meshes skip
+            // the SI-cleanup step, but the late-pipeline (T-junction,
+            // nm_patch_remesh, collapse_nm) still cleans local NM and
+            // the do-no-harm guard restores clean inputs we damage.
+            const bool too_large = merged_solid.faces.size() > kHugeCleanupMaxFaces;
+            if (too_large && !aabb_disjoint) {
+                result.notes.push_back("intersections: skipped (mesh too "
+                    "large, " + std::to_string(merged_solid.faces.size()) +
+                    " faces > " + std::to_string(kHugeCleanupMaxFaces) +
+                    " cap)");
+            }
+            if (!too_large && !aabb_disjoint &&
+                (pre_diag.component_count > 1 ||
+                 pre_diag.non_manifold_edges > 0)) {
                 auto ir = stages::resolve_intersections(merged_solid);
                 if (!ir.manifold_failed) {
                     auto post_diag = cached_diag(ir.mesh);
@@ -941,7 +1230,22 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         const size_t pile_faces = pile_bag.faces.size();
         const bool   pile_guard = (pile_faces >= 1000);
         const size_t pile_min   = pile_guard ? pile_faces / 10 : 0;
-        auto sr = stages::reconstruct_soup(pile_bag);
+        // Same 800 k F cap as Phase 8R's reconstruct_soup call. A huge pile
+        // is typically the leftover of Phase 8R's own size-capped skip
+        // (a big NM-but-mostly-coherent closed component routed straight
+        // to pile). Re-running reconstruct_soup on it here would hang in
+        // exactly the same way it did in Phase 8R. Skip and let the
+        // raw-pile-append + destruction-fallback paths handle it.
+        stages::SoupResult sr;
+        if (pile_faces > kReconstructSoupMaxFaces) {
+            sr.was_needed = true;
+            sr.success    = false;
+            result.notes.push_back("pile-reintegration: skipped (pile too "
+                "large, " + std::to_string(pile_faces) + " faces > " +
+                std::to_string(kReconstructSoupMaxFaces) + " cap)");
+        } else {
+            sr = stages::reconstruct_soup(pile_bag);
+        }
         const bool collapsed = pile_guard && sr.was_needed && sr.success &&
                                sr.mesh.faces.size() < pile_min;
         if (collapsed) {
@@ -1249,22 +1553,22 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             // cleanly. The snapshot-revert guard below catches the cases
             // where it doesn't, so the worst-case is "same as before".
             //
-            // Threshold raised 20 → 400 on 2026-05-15: the old limit was
-            // set under the per-axis `worsened` rule, where a fill that
-            // turned 32 boundary edges into 5 NM edges looked like a
-            // regression and was reverted (the "mug regression at 50"
-            // noted historically). The new total-defect `worsened` rule
-            // (bnd+nm) correctly scores that as a 32→5 improvement, so the
-            // loop can safely attempt larger boundary residuals — the
-            // snapshot-revert + volume-collapse guards still catch genuine
-            // regressions. 400 catches lobster (32), teapot (37), human
-            // (55), mug (166); excludes only pathological huge-boundary
-            // open shells (partial_cylinder etc.) which are stable
-            // end-states fill_holes can't close anyway.
+            // Threshold raised 20 → 400 → 5000:
+            //   - 20→400 (2026-05-15): old limit set under per-axis
+            //     `worsened` rule that misjudged 32→5 NM as a regression.
+            //     Total-defect `worsened` rule (bnd+nm) is correct.
+            //   - 400→5000 (this commit): pile-reintegrated multi-shell
+            //     inputs (togepi_.3mf bnd=3798, cute_ghost_parts bnd=406,
+            //     test.stl bnd=408, Bee_v3.stl) had output boundary just
+            //     above 400 — the cleanup_loop refused to even try.
+            //     Snapshot-revert + volume-collapse guards inside the
+            //     loop catch genuine regressions, and the partial_cylinder
+            //     class of pathology (small bnd ~66) was never the
+            //     reason for the 400 ceiling — it sits well below.
             const bool small_boundary_only =
                 pre.non_manifold_edges == 0 &&
                 pre.open_boundary_edges > 0 &&
-                pre.open_boundary_edges <= 400;
+                pre.open_boundary_edges <= 5000;
             if (pre.non_manifold_edges == 0 && !small_boundary_only) break;
 
             // For small-boundary residuals, the boundaries are often
@@ -1375,6 +1679,8 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // spanning face(s) through the collinear vertices pairs the sub-edges
     // 2-to-1 and closes the slit with no degenerate faces. Guarded on total
     // defect (bnd+nm) so a mis-split cannot worsen the mesh.
+    // T-junction is fast even on huge meshes (1.86 s on Groot's 2 M F,
+    // mostly the edge-incidence map build); no face-count cap needed.
     if (opts.holes && !result.mesh.faces.empty()) {
         auto pre = diag_of_result();
         if (pre.open_boundary_edges > 0 || pre.non_manifold_edges > 0) {
@@ -1521,7 +1827,35 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 auto post = cached_diag(cr.mesh);
                 double v0 = std::abs(pre.signed_volume);
                 double dv = std::abs(post.signed_volume - pre.signed_volume);
-                if (v0 < 1e-300 || dv <= 0.005 * v0) {
+                // Dual-scale guard: accept if EITHER dv is small relative
+                // to signed volume OR small relative to bbox volume.
+                // Signed-volume-only fails the AABB-disjoint invariance —
+                // an absolute change of (say) 700 mm³ is 0.7 % of a small
+                // mesh's volume but only 0.2 % of the same mesh combined
+                // with another AABB-disjoint sibling. The bbox³ secondary
+                // is invariant to that splitting because each cluster's
+                // bbox is unchanged whether it is processed alone or
+                // alongside others. Fix discovered on Main_Body_parts
+                // where spatial-split rejected a collapse the whole-mesh
+                // path accepted, leaving residual nm=13 vs the whole-mesh
+                // nm=0.
+                double bbv0 = 0.0;
+                if (!result.mesh.vertices.empty()) {
+                    double lo[3] = { result.mesh.vertices[0][0],
+                                     result.mesh.vertices[0][1],
+                                     result.mesh.vertices[0][2] };
+                    double hi[3] = { lo[0], lo[1], lo[2] };
+                    for (const auto& v : result.mesh.vertices)
+                        for (int k = 0; k < 3; ++k) {
+                            if (v[k] < lo[k]) lo[k] = v[k];
+                            if (v[k] > hi[k]) hi[k] = v[k];
+                        }
+                    bbv0 = (hi[0]-lo[0]) * (hi[1]-lo[1]) * (hi[2]-lo[2]);
+                }
+                const bool vol_ok = (v0 < 1e-300) ||
+                                    (dv <= 0.005 * v0) ||
+                                    (bbv0 > 0.0 && dv <= 0.005 * bbv0);
+                if (vol_ok) {
                     result.mesh = std::move(cr.mesh);
                     add_stage("collapse_nm");
                     result.notes.push_back("collapse_nm: " +
@@ -1606,7 +1940,25 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 auto post = cached_diag(nr.mesh);
                 const double v0 = std::abs(pre.signed_volume);
                 const double dv = std::abs(post.signed_volume - pre.signed_volume);
-                if (post_d < pre_d && (v0 < 1e-300 || dv <= 0.005 * v0)) {
+                // Dual-scale volume guard, same reasoning as collapse_nm:
+                // signed-volume-only breaks the per-cluster invariance.
+                double nbbv = 0.0;
+                if (!result.mesh.vertices.empty()) {
+                    double lo[3] = { result.mesh.vertices[0][0],
+                                     result.mesh.vertices[0][1],
+                                     result.mesh.vertices[0][2] };
+                    double hi[3] = { lo[0], lo[1], lo[2] };
+                    for (const auto& v : result.mesh.vertices)
+                        for (int k = 0; k < 3; ++k) {
+                            if (v[k] < lo[k]) lo[k] = v[k];
+                            if (v[k] > hi[k]) hi[k] = v[k];
+                        }
+                    nbbv = (hi[0]-lo[0]) * (hi[1]-lo[1]) * (hi[2]-lo[2]);
+                }
+                const bool vol_ok = (v0 < 1e-300) ||
+                                    (dv <= 0.005 * v0) ||
+                                    (nbbv > 0.0 && dv <= 0.005 * nbbv);
+                if (post_d < pre_d && vol_ok) {
                     add_stage("nm_local_repair");
                     result.notes.push_back("nm_local_repair: " +
                         std::to_string(nr.merges) + " merges, " +
@@ -1746,6 +2098,24 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             // ~0.
             if (ncomp > 1) {
                 const uint32_t size_gate = std::max<uint32_t>(200, nf / 100);
+                // Pre-compute one representative face per component (centroid
+                // origin). The previous code had an inner O(F) scan inside
+                // the per-candidate loop to find the first face of comp c
+                // — O(C × F) total. With the cache it's O(F) once.
+                std::vector<uint32_t> first_face(ncomp, UINT32_MAX);
+                for (uint32_t fi = 0; fi < nf; ++fi) {
+                    const int32_t c = comp[fi];
+                    if (first_face[c] == UINT32_MAX) first_face[c] = fi;
+                }
+                // Pre-build the largest-component face index list once
+                // (instead of re-scanning all F faces inside each candidate's
+                // ray-cast loop). On Groot-class 2 M F meshes with many small
+                // contained-candidate components this drops the containment
+                // check from O(candidates × F) to O(F + candidates × F_main).
+                std::vector<uint32_t> main_faces;
+                main_faces.reserve(cface[largest_comp]);
+                for (uint32_t fi = 0; fi < nf; ++fi)
+                    if (comp[fi] == largest_comp) main_faces.push_back(fi);
                 // ray-triangle (Möller) along +x
                 auto ray_hit = [&](const std::array<double,3>& o,
                                    const std::array<double,3>& v0,
@@ -1772,19 +2142,17 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     if (c == largest_comp || drop_comp[c]) continue;
                     if (cface[c] > size_gate) continue;
                     if (std::abs(cvol[c]) >= max_vol * 0.01) continue;
-                    // origin = centroid of first face of component c
+                    // origin = centroid of pre-cached first face of comp c
                     std::array<double,3> origin{0,0,0};
-                    for (uint32_t fi = 0; fi < nf; ++fi) {
-                        if (comp[fi] != c) continue;
-                        const auto& f = result.mesh.faces[fi];
+                    const uint32_t ff = first_face[c];
+                    if (ff != UINT32_MAX) {
+                        const auto& f = result.mesh.faces[ff];
                         for (int k = 0; k < 3; ++k)
                             for (int d = 0; d < 3; ++d)
                                 origin[d] += result.mesh.vertices[f[k]][d] / 3.0;
-                        break;
                     }
                     int crossings = 0;
-                    for (uint32_t fi = 0; fi < nf; ++fi) {
-                        if (comp[fi] != largest_comp) continue;
+                    for (uint32_t fi : main_faces) {
                         const auto& f = result.mesh.faces[fi];
                         if (ray_hit(origin, result.mesh.vertices[f[0]],
                                     result.mesh.vertices[f[1]],
@@ -1819,6 +2187,77 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         }
     }
 
+    // --- Coplanar 4-fan resolver ---
+    // Drops "duplicate layer" face pairs from same-sided coplanar 4-fans
+    // around NM edges (typical of multi-color 3MF exports and coplanar
+    // CSG seams: 4 coplanar triangles share one chord with 2 forward +
+    // 2 reverse winding — the smaller-area pair is a duplicate layer).
+    // Each dropped face has 2 outer edges that connected to surrounding
+    // manifold geometry, so the drop opens 2 × fans_dropped × 2 boundary
+    // edges; we immediately close them with fill_holes so the net effect
+    // is just "remove the NM" without leaving holes.
+    // Guard: keep only if total defect (bnd + nm) strictly drops.
+    if (opts.non_manifold && opts.holes && !result.mesh.faces.empty() &&
+        opts.allow_carve_refill && opts.recursion_depth < 2) {
+        auto cfd = stages::coplanar_fan_drop(result.mesh);
+        if (cfd.applied && cfd.fans_dropped > 0) {
+            // The drop leaves boundary holes that a single fill_holes
+            // can't close cleanly (fills can collide with neighbour
+            // surface). Re-enter repair() recursively on the dropped
+            // mesh — its full late-cleanup chain (fill_holes +
+            // nm_edge + orient + nm_patch_remesh + collapse_nm + …)
+            // settles the result properly. Same pattern as
+            // nm_carve_refill's recursive re-entry.
+            auto pre = cached_diag(result.mesh);
+            RepairOptions nested = opts;
+            nested.recursion_depth   = opts.recursion_depth + 1;
+            nested.allow_carve_refill = false;   // no further recursion
+            RepairResult inner = repair(cfd.mesh, nested);
+            auto post = cached_diag(inner.mesh);
+            const int pre_d  = static_cast<int>(pre.open_boundary_edges) +
+                               static_cast<int>(pre.non_manifold_edges);
+            const int post_d = static_cast<int>(post.open_boundary_edges) +
+                               static_cast<int>(post.non_manifold_edges);
+            // Volume guard: dropped pairs are zero-volume (coplanar
+            // duplicates), so vol should barely move. Same dual-scale
+            // gate as nm_carve_refill.
+            const double v0 = std::abs(pre.signed_volume);
+            const double dv = std::abs(post.signed_volume - pre.signed_volume);
+            double bbv = 0.0;
+            if (!result.mesh.vertices.empty()) {
+                double plo[3] = { result.mesh.vertices[0][0],
+                                  result.mesh.vertices[0][1],
+                                  result.mesh.vertices[0][2] };
+                double phi[3] = { plo[0], plo[1], plo[2] };
+                for (const auto& pv : result.mesh.vertices)
+                    for (int k = 0; k < 3; ++k) {
+                        if (pv[k] < plo[k]) plo[k] = pv[k];
+                        if (pv[k] > phi[k]) phi[k] = pv[k];
+                    }
+                bbv = (phi[0]-plo[0]) * (phi[1]-plo[1]) * (phi[2]-plo[2]);
+            }
+            const bool vol_ok = (v0 < 1e-300) ||
+                                (dv <= 0.05 * v0) ||
+                                (bbv > 0.0 && dv <= 0.005 * bbv);
+            if (post_d < pre_d && vol_ok) {
+                add_stage("coplanar_fan_drop");
+                result.notes.push_back("coplanar_fan_drop: dropped " +
+                    std::to_string(cfd.fans_dropped) +
+                    " coplanar 4-fan duplicate pair(s), recursive "
+                    "cleanup (defect " + std::to_string(pre_d) + " -> " +
+                    std::to_string(post_d) + ")");
+                result.mesh = std::move(inner.mesh);
+                for (const auto& s : inner.stages_applied)
+                    if (std::find(result.stages_applied.begin(),
+                                  result.stages_applied.end(), s) ==
+                        result.stages_applied.end())
+                        result.stages_applied.push_back(s);
+                for (const auto& n : inner.notes)
+                    result.notes.push_back("[cfd-recursed] " + n);
+            }
+        }
+    }
+
     prof_lap("pre:nm_carve_refill");
     // --- NM carve + recursive pipeline re-entry ---
     // For stubborn residual NM edges that all the local stages failed to
@@ -1839,8 +2278,17 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     //     is often index-space invisible until snapped to float32).
     //   - the recursive result must strictly improve total defect AND
     //     stay within 5 % volume of the pre-carve mesh.
-    if (opts.allow_carve_refill && opts.recursion_depth < 2 &&
-        !result.mesh.faces.empty()) {
+    // Iterate carve_refill up to 4x: each successful pass may unlock
+    // further reduction. Observed: front_7color.3mf needs 2 passes
+    // (nm 6→1→0), Benchy_Hull needs 3 passes (nm 3→...→0). Cap at 4 —
+    // each iter runs a full recursive repair() on the carved mesh, but
+    // the loop's strict-improvement check terminates early, so cases
+    // that don't benefit see at most 1 wasted iter.
+    int prev_iter_nm = INT_MAX;
+    for (int carve_iter = 0;
+         carve_iter < 4 && opts.allow_carve_refill &&
+         opts.recursion_depth < 2 && !result.mesh.faces.empty();
+         ++carve_iter) {
         // Float32-snap-weld a probe copy to expose index-invisible NM.
         Mesh probe = result.mesh;
         {
@@ -1872,6 +2320,13 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
             probe = std::move(welded);
         }
         auto pre = cached_diag(probe);
+        // Stall break: if previous iter didn't reduce nm, stop. (Also
+        // covers the nm == 0 case implicitly — INT_MAX > 0 on iter 0,
+        // then after a successful pass that brought nm to 0 the loop
+        // body's gate `pre.non_manifold_edges > 0` won't fire next iter.)
+        if (carve_iter > 0 && (int)pre.non_manifold_edges >= prev_iter_nm)
+            break;
+        prev_iter_nm = (int)pre.non_manifold_edges;
         // Carve+refill is the right tool for SMALL residual NM (1-10 ish):
         // the carve is local, the Liepa refill knits a clean patch, the
         // recursive repair settles it. For LARGE residuals (kytka1: nm=101
@@ -2018,13 +2473,50 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         // with a coarse remesh, and alpha_wrap can bloat a near-miss enough
         // to fool a volume-only adopt test.
         const bool destroyed = not_clean && cur.component_count > 1;
-        if (destroyed) {
+        // Early-skip when adopt criteria can't possibly fire — saves the
+        // 100+ s alpha_wrap call on huge near-clean inputs (Groot 2 M F
+        // with cur.nm=0 bnd>0 c>1 was eating 173 s here for a wrap that
+        // wouldn't be adopted). Predictions:
+        //   adopt_vol_recovery needs vox_vol > 1.5 × cur_vol. alpha_wrap
+        //     preserves the input's volume, so when cur_vol ≈ input_vol
+        //     (within 1.5×) vox_vol can't exceed 1.5 × cur_vol. Skip.
+        //   adopt_nm_cleanup needs cur.nm > 10. Skip when cur.nm ≤ 10.
+        // The early skip combines both: skip iff both predictions hold.
+        double cur_vol_est = std::abs(cur.signed_volume);
+        bool skip_wrap = false;
+        if (destroyed && cur.non_manifold_edges <= 10) {
+            // Compute input vol cheaply (we already have input_welded).
+            double in_vol = 0.0;
+            for (const auto& f : mesh.faces) {
+                const auto& a = mesh.vertices[f[0]];
+                const auto& b = mesh.vertices[f[1]];
+                const auto& c = mesh.vertices[f[2]];
+                const double cx = b[1]*c[2] - b[2]*c[1];
+                const double cy = b[2]*c[0] - b[0]*c[2];
+                const double cz = b[0]*c[1] - b[1]*c[0];
+                in_vol += (a[0]*cx + a[1]*cy + a[2]*cz) / 6.0;
+            }
+            in_vol = std::abs(in_vol);
+            if (in_vol < 1.5 * cur_vol_est) {
+                skip_wrap = true;
+                result.notes.push_back("destruction fallback: skipped (cur nm=" +
+                    std::to_string(cur.non_manifold_edges) +
+                    " <= 10 and input volume ratio " +
+                    std::to_string(in_vol / std::max(cur_vol_est, 1.0)) +
+                    " < 1.5; adopt criteria can't fire)");
+            }
+        }
+        if (destroyed && !skip_wrap) {
             auto vr = stages::alpha_wrap(mesh);
             if (vr.success && !vr.mesh.faces.empty()) {
                 // The marching-cubes output can carry a few non-manifold
                 // edges from float32 vertex collisions in dense output — erase
-                // them with the same guarded edge-collapse used elsewhere so
-                // the reconstruction is a clean watertight solid.
+                // them. collapse_nm_region handles most cases; for the
+                // multi-shell-overlap inputs (kytka1: 22 components welded by
+                // intersections into a single non-manifold surface) the
+                // residual NM is structural and collapse_nm cannot clear it.
+                // Fall through to nm_patch_remesh (BFS-delete + Liepa refill)
+                // which knits a clean 2-manifold disk over each NM region.
                 {
                     auto vd0 = cached_diag(vr.mesh);
                     if (vd0.non_manifold_edges > 0) {
@@ -2033,19 +2525,82 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                             vr.mesh = std::move(vc.mesh);
                     }
                 }
+                // Iterative cleanup on alpha_wrap output:
+                //   nm_patch_remesh (rings=1, smallest BFS patch — clears
+                //   most MC pinch-point NM cleanly; larger rings tend to
+                //   CREATE new NM where Liepa fills cross neighbouring
+                //   surface; observed 8 → 184 on kytka1 with rings=2)
+                //   then collapse_nm (mops up residual NM after fills),
+                //   repeat while total nm strictly drops.
+                {
+                    int prev_nm = cached_diag(vr.mesh).non_manifold_edges;
+                    for (int it = 0; it < 4 && prev_nm > 0; ++it) {
+                        // Ring-retry: smallest ring that strictly improves
+                        // nm_after wins. Same ordering as the early
+                        // nm_patch_remesh loop — empirically right (1 first,
+                        // 0 next to escape tangled-NM stalls, 2-4 last resort).
+                        for (int rings : {1, 0, 2, 3, 4}) {
+                            auto pr = stages::remesh_nm_patches(vr.mesh, rings);
+                            if (pr.applied && pr.nm_after < pr.nm_before) {
+                                vr.mesh = std::move(pr.mesh);
+                                break;
+                            }
+                        }
+                        auto vc = stages::collapse_nm_region(vr.mesh);
+                        if (vc.applied && vc.nm_after < vc.nm_before)
+                            vr.mesh = std::move(vc.mesh);
+                        const int after = cached_diag(vr.mesh).non_manifold_edges;
+                        if (after >= prev_nm) break;
+                        prev_nm = after;
+                    }
+                }
                 auto vd = cached_diag(vr.mesh);
                 const bool vox_clean = vd.open_boundary_edges == 0 &&
                                        vd.non_manifold_edges == 0;
                 const double cur_vol = std::abs(cur.signed_volume);
                 const double vox_vol = std::abs(vd.signed_volume);
-                if (vox_clean && vox_vol > 1.5 * cur_vol) {
+                // Two adopt paths:
+                //   (1) Volume-recovery: pipeline output kept only a fraction
+                //       of the true volume (vox_vol > 1.5x cur_vol). Original
+                //       destruction-fallback case (LDraw soup, fragmented
+                //       multi-shell exports).
+                //   (2) NM-cleanup: pipeline output is heavily non-manifold
+                //       (cur.nm > 10), the wrap reconstruction is dramatically
+                //       cleaner (≤ 1/10th the NM AND ≤ 5 absolute), AND it
+                //       preserves the volume (0.7..1.5 × current). This is
+                //       kytka1's pattern: 22 components welded by intersections
+                //       into nm=101, wrapped to nm=4 — a 25× improvement,
+                //       both still non-manifold but the wrapped output is
+                //       slicer-recoverable where nm=101 is not. The 1/10
+                //       ratio + absolute-5 cap mean we only adopt a wrap
+                //       that's a substantial improvement; small residuals
+                //       (cur.nm < 10) keep their original-geometry output.
+                const bool adopt_vol_recovery = vox_clean && vox_vol > 1.5 * cur_vol;
+                const bool adopt_nm_cleanup   =
+                    cur.non_manifold_edges > 10 &&
+                    vd.open_boundary_edges == 0 &&
+                    vd.non_manifold_edges <= cur.non_manifold_edges / 10 &&
+                    vd.non_manifold_edges <= 5 &&
+                    vox_vol > 0.7 * cur_vol &&
+                    vox_vol < 1.5 * cur_vol;
+                if (adopt_vol_recovery || adopt_nm_cleanup) {
                     result.mesh = std::move(vr.mesh);
                     add_stage("alpha_wrap");
-                    result.notes.push_back(
-                        "destruction fallback: pipeline output kept only "
-                        + std::to_string(cur_vol) + " of ~"
-                        + std::to_string(vox_vol) + " volume — recovered via "
-                        "whole-input alpha-wrap reconstruction");
+                    if (adopt_vol_recovery) {
+                        result.notes.push_back(
+                            "destruction fallback: pipeline output kept only "
+                            + std::to_string(cur_vol) + " of ~"
+                            + std::to_string(vox_vol) + " volume — recovered "
+                            "via whole-input alpha-wrap reconstruction");
+                    } else {
+                        result.notes.push_back(
+                            "destruction fallback: pipeline output had nm=" +
+                            std::to_string(cur.non_manifold_edges) +
+                            " — replaced with alpha-wrap reconstruction "
+                            "(nm=" + std::to_string(vd.non_manifold_edges) +
+                            ", volume " + std::to_string(cur_vol) + " -> " +
+                            std::to_string(vox_vol) + ")");
+                    }
                 }
             }
         }

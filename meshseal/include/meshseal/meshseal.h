@@ -109,6 +109,18 @@ struct RepairOptions {
     // Bumped by the dispatcher; not for user code to set.
     int  recursion_depth      = 0;
     bool allow_carve_refill   = true;
+    // When true, the dispatcher checks for AABB-disjoint clusters of
+    // connected components up front and recurses per-cluster (with
+    // allow_spatial_split = false to prevent re-entry). On a multi-object
+    // STL — common real-world export of several objects on a print plate —
+    // each cluster runs the full pipeline at its OWN bbox scale, which is
+    // the meaningful win for alpha_wrap (voxel grid sized per-cluster
+    // instead of whole-plate). NM count is unchanged: AABB-disjoint shells
+    // have zero geometric coupling, so per-cluster intersections produces
+    // the same NM as the whole-mesh union. Single-cluster inputs (most of
+    // the corpus) fall through to the existing path at near-zero cost.
+    // Not for user code to set.
+    bool allow_spatial_split  = true;
 };
 
 RepairResult repair(const Mesh& mesh, const RepairOptions& opts = RepairOptions{});

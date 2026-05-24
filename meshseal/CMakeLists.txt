@@ -25,6 +25,7 @@ add_library(meshseal STATIC
     src/stages/nm_local_repair.cpp
     src/stages/si_split.cpp
     src/stages/nm_carve_refill.cpp
+    src/stages/coplanar_fan_drop.cpp
     src/internal/halfedge.cpp
     src/internal/bvh.cpp
     src/internal/diagnostics.cpp

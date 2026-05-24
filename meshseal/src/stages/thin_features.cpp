@@ -54,8 +54,42 @@ ThinResult remove_thin_features(const Mesh& mesh,
         normals[i] = normalize(cross(sub(v1, v0), sub(v2, v0)));
     }
 
-    // 2. Build spatial hash grid
-    const double cell_size = distance_threshold > 0.0 ? distance_threshold : 1e-3;
+    // 2. Build spatial hash grid.
+    //
+    // Cell size needs two properties:
+    //   - large enough that the 27-cell neighbourhood always contains every
+    //     other face within distance_threshold (so we never miss a pair)
+    //   - large enough that each cell holds only O(few) faces on a normal
+    //     surface mesh (otherwise the 27-cell scan is dense and slow)
+    //
+    // The fixed 1e-3 default cell size used to violate the second property
+    // on huge meshes: a 2 M-face mesh with mm-scale bbox has many faces
+    // per mm³, so each 1 mm cell holds dozens of faces and the 27-cell
+    // scan becomes O(face²)-ish locally. Adapt cell size to a multiple of
+    // the mean edge length when that's larger than the requested
+    // threshold: keeps the candidate set per cell small while still
+    // catching every pair within distance_threshold (since 2 * mean_edge
+    // already exceeds it on a uniformly-meshed surface).
+    double mean_edge2 = 0.0;
+    {
+        const uint32_t sample_n = std::min<uint32_t>(nf, 4096);
+        for (uint32_t i = 0; i < sample_n; ++i) {
+            const auto& f = mesh.faces[i];
+            const Vec3d& a = mesh.vertices[f[0]];
+            const Vec3d& b = mesh.vertices[f[1]];
+            const Vec3d& c = mesh.vertices[f[2]];
+            const double e1 = (b[0]-a[0])*(b[0]-a[0]) + (b[1]-a[1])*(b[1]-a[1]) + (b[2]-a[2])*(b[2]-a[2]);
+            const double e2 = (c[0]-b[0])*(c[0]-b[0]) + (c[1]-b[1])*(c[1]-b[1]) + (c[2]-b[2])*(c[2]-b[2]);
+            const double e3 = (a[0]-c[0])*(a[0]-c[0]) + (a[1]-c[1])*(a[1]-c[1]) + (a[2]-c[2])*(a[2]-c[2]);
+            mean_edge2 += (e1 + e2 + e3) / 3.0;
+        }
+        mean_edge2 /= sample_n;
+    }
+    const double mean_edge = std::sqrt(mean_edge2);
+    const double thr = distance_threshold > 0.0 ? distance_threshold : 1e-3;
+    // We need cell_size >= thr (so any pair within thr is in 27-neighbour
+    // set) AND cell_size >= ~mean_edge (so cell occupancy stays small).
+    const double cell_size = std::max(thr, mean_edge);
 
     std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
     grid.reserve(nf);
