@@ -131,49 +131,177 @@ void write_3mf(const Mesh& mesh, const std::filesystem::path& path) {
 }
 
 // ---------------------------------------------------------------------------
+// write_3mf_volumes — multi-object 3MF preserving per-volume separation
+// ---------------------------------------------------------------------------
+
+void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
+                       const std::filesystem::path& path,
+                       bool write_slic3r_config) {
+    if (volumes.empty()) {
+        throw ThreeMfError("write_3mf_volumes: no volumes provided");
+    }
+
+    // Build the 3dmodel.model XML with one <object> per volume.
+    std::string model;
+    // Rough pre-allocation: one <vertex .../> per vertex is ~60 chars,
+    // one <triangle .../> per face is ~40 chars; plus per-object overhead.
+    size_t total_v = 0, total_f = 0;
+    for (const auto& vol : volumes) {
+        total_v += vol.mesh.vertices.size();
+        total_f += vol.mesh.faces.size();
+    }
+    model.reserve(256 + total_v * 60 + total_f * 40 + volumes.size() * 200);
+
+    model +=
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">\n"
+        "  <resources>\n";
+
+    char buf[128];
+    for (size_t i = 0; i < volumes.size(); ++i) {
+        const auto& vol = volumes[i];
+        // Object IDs start at 1 (3MF convention).
+        std::snprintf(buf, sizeof(buf),
+            "    <object id=\"%zu\" type=\"model\">\n"
+            "      <mesh>\n"
+            "        <vertices>\n", i + 1);
+        model += buf;
+        for (const auto& v : vol.mesh.vertices) {
+            std::snprintf(buf, sizeof(buf),
+                "          <vertex x=\"%.17g\" y=\"%.17g\" z=\"%.17g\"/>\n",
+                v[0], v[1], v[2]);
+            model += buf;
+        }
+        model += "        </vertices>\n        <triangles>\n";
+        for (const auto& f : vol.mesh.faces) {
+            std::snprintf(buf, sizeof(buf),
+                "          <triangle v1=\"%u\" v2=\"%u\" v3=\"%u\"/>\n",
+                f[0], f[1], f[2]);
+            model += buf;
+        }
+        model +=
+            "        </triangles>\n"
+            "      </mesh>\n"
+            "    </object>\n";
+    }
+
+    model +=
+        "  </resources>\n"
+        "  <build>\n";
+    for (size_t i = 0; i < volumes.size(); ++i) {
+        std::snprintf(buf, sizeof(buf),
+            "    <item objectid=\"%zu\"/>\n", i + 1);
+        model += buf;
+    }
+    model +=
+        "  </build>\n"
+        "</model>\n";
+
+    // Optional: Slic3r_PE_model.config preserving the volume partition.
+    // The PrusaSlicer slicer reader expects ALL volumes packed into one
+    // <object> with firstid/lastid pointing at concatenated triangle
+    // indices. This is the inverse of the read_3mf_volumes parsing.
+    std::string slic3r_cfg;
+    if (write_slic3r_config) {
+        slic3r_cfg.reserve(256 + volumes.size() * 200);
+        slic3r_cfg += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n";
+        // Single <object id="1"> entry — concatenated face indices.
+        // Note: this is provided as a hint for downstream PrusaSlicer round-
+        // trip; our PRIMARY output is the multi-<object> 3MF above (each
+        // slicer object is a separate physical body). PrusaSlicer can read
+        // either form; multi-<object> matches what e.g. write_3mf gives.
+        slic3r_cfg += "  <object id=\"1\" instances_count=\"1\">\n";
+        uint32_t cur_first = 0;
+        for (const auto& vol : volumes) {
+            const uint32_t nf = static_cast<uint32_t>(vol.mesh.faces.size());
+            if (nf == 0) continue;
+            std::snprintf(buf, sizeof(buf),
+                "    <volume firstid=\"%u\" lastid=\"%u\">\n",
+                cur_first, cur_first + nf - 1);
+            slic3r_cfg += buf;
+            // Escape the name minimally (no quotes / angle brackets in
+            // typical Slic3r names; PrusaSlicer's names look like
+            // "Bee_v3.stl_1_4"). Pass-through for now.
+            slic3r_cfg += "      <metadata type=\"volume\" key=\"name\" value=\"";
+            for (char c : vol.name) {
+                if (c == '"' || c == '<' || c == '>' || c == '&') continue;
+                slic3r_cfg += c;
+            }
+            slic3r_cfg += "\"/>\n";
+            slic3r_cfg += "      <metadata type=\"volume\" key=\"volume_type\" value=\"ModelPart\"/>\n";
+            std::snprintf(buf, sizeof(buf),
+                "      <metadata type=\"volume\" key=\"extruder\" value=\"%d\"/>\n",
+                vol.extruder);
+            slic3r_cfg += buf;
+            slic3r_cfg += "    </volume>\n";
+            cur_first += nf;
+        }
+        slic3r_cfg += "  </object>\n</config>\n";
+    }
+
+    // Pack into ZIP.
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_file(&zip, path.string().c_str(), 0)) {
+        throw ThreeMfError("cannot create 3MF file: " + path.string());
+    }
+
+    bool ok = true;
+
+    ok = ok && mz_zip_writer_add_mem(&zip, "[Content_Types].xml",
+        k_content_types, std::strlen(k_content_types),
+        MZ_DEFAULT_COMPRESSION);
+
+    static const char* k_rels =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n"
+        "  <Relationship Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\""
+        " Target=\"/3D/3dmodel.model\" Id=\"rel0\"/>\n"
+        "</Relationships>\n";
+
+    ok = ok && mz_zip_writer_add_mem(&zip, "_rels/.rels",
+        k_rels, std::strlen(k_rels),
+        MZ_DEFAULT_COMPRESSION);
+
+    ok = ok && mz_zip_writer_add_mem(&zip, "3D/3dmodel.model",
+        model.data(), model.size(),
+        MZ_DEFAULT_COMPRESSION);
+
+    if (write_slic3r_config && !slic3r_cfg.empty()) {
+        ok = ok && mz_zip_writer_add_mem(&zip, "Metadata/Slic3r_PE_model.config",
+            slic3r_cfg.data(), slic3r_cfg.size(),
+            MZ_DEFAULT_COMPRESSION);
+    }
+
+    ok = ok && mz_zip_writer_finalize_archive(&zip);
+    mz_zip_writer_end(&zip);
+
+    if (!ok) {
+        throw ThreeMfError("error writing 3MF archive: " + path.string());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // read_3mf
 // ---------------------------------------------------------------------------
 
-Mesh read_3mf(const std::filesystem::path& path) {
-    mz_zip_archive zip{};
-    if (!mz_zip_reader_init_file(&zip, path.string().c_str(), 0)) {
-        throw ThreeMfError("cannot open 3MF file: " + path.string());
-    }
-
-    // Locate 3D/3dmodel.model (case-sensitive per spec)
-    int idx = mz_zip_reader_locate_file(&zip, "3D/3dmodel.model", nullptr, 0);
-    if (idx < 0) {
-        mz_zip_reader_end(&zip);
-        throw ThreeMfError("3D/3dmodel.model not found in archive");
-    }
-
-    size_t out_size = 0;
-    void* raw = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(idx), &out_size, 0);
-    mz_zip_reader_end(&zip);
-
-    if (!raw) {
-        throw ThreeMfError("failed to extract 3D/3dmodel.model");
-    }
-
-    std::string xml(static_cast<const char*>(raw), out_size);
-    mz_free(raw);
-
-    // --- Parse vertices ---
-    const size_t verts_open = xml.find("<vertices>");
-    const size_t verts_close = xml.find("</vertices>");
-    if (verts_open == std::string::npos || verts_close == std::string::npos) {
-        throw ThreeMfError("missing <vertices> section in 3MF model");
-    }
-
-    const size_t tris_open = xml.find("<triangles>");
-    const size_t tris_close = xml.find("</triangles>");
-    if (tris_open == std::string::npos || tris_close == std::string::npos) {
-        throw ThreeMfError("missing <triangles> section in 3MF model");
+// Parse one <mesh>...</mesh> block (assumed to live inside the substring
+// [begin..end)) and return the resulting Mesh. The mesh vertex indices are
+// LOCAL to this mesh block; the caller is responsible for any concatenation.
+static Mesh parse_3mf_mesh_block(const std::string& xml,
+                                 size_t begin, size_t end) {
+    const size_t verts_open  = xml.find("<vertices>",  begin);
+    const size_t verts_close = xml.find("</vertices>", begin);
+    const size_t tris_open   = xml.find("<triangles>",  begin);
+    const size_t tris_close  = xml.find("</triangles>", begin);
+    if (verts_open  == std::string::npos || verts_open  > end ||
+        verts_close == std::string::npos || verts_close > end ||
+        tris_open   == std::string::npos || tris_open   > end ||
+        tris_close  == std::string::npos || tris_close  > end) {
+        throw ThreeMfError("missing <vertices>/<triangles> in 3MF <mesh> block");
     }
 
     Mesh mesh;
-
-    // Parse <vertex ...> tags
+    // <vertex>
     {
         size_t pos = verts_open + std::strlen("<vertices>");
         while (pos < verts_close) {
@@ -181,28 +309,21 @@ Mesh read_3mf(const std::filesystem::path& path) {
             if (tag_start == std::string::npos || tag_start >= verts_close) break;
             const size_t tag_end = xml.find('>', tag_start);
             if (tag_end == std::string::npos) break;
-
             const std::string tag = xml.substr(tag_start, tag_end - tag_start + 1);
             const std::string sx = get_attr(tag, "x");
             const std::string sy = get_attr(tag, "y");
             const std::string sz = get_attr(tag, "z");
-            if (sx.empty() || sy.empty() || sz.empty()) {
+            if (sx.empty() || sy.empty() || sz.empty())
                 throw ThreeMfError("vertex tag missing x/y/z attribute");
-            }
             try {
-                mesh.vertices.push_back({
-                    std::stod(sx),
-                    std::stod(sy),
-                    std::stod(sz)
-                });
+                mesh.vertices.push_back({ std::stod(sx), std::stod(sy), std::stod(sz) });
             } catch (const std::exception& e) {
                 throw ThreeMfError(std::string("invalid vertex coordinate: ") + e.what());
             }
             pos = tag_end + 1;
         }
     }
-
-    // Parse <triangle ...> tags
+    // <triangle>
     {
         size_t pos = tris_open + std::strlen("<triangles>");
         while (pos < tris_close) {
@@ -210,14 +331,12 @@ Mesh read_3mf(const std::filesystem::path& path) {
             if (tag_start == std::string::npos || tag_start >= tris_close) break;
             const size_t tag_end = xml.find('>', tag_start);
             if (tag_end == std::string::npos) break;
-
             const std::string tag = xml.substr(tag_start, tag_end - tag_start + 1);
             const std::string sv1 = get_attr(tag, "v1");
             const std::string sv2 = get_attr(tag, "v2");
             const std::string sv3 = get_attr(tag, "v3");
-            if (sv1.empty() || sv2.empty() || sv3.empty()) {
+            if (sv1.empty() || sv2.empty() || sv3.empty())
                 throw ThreeMfError("triangle tag missing v1/v2/v3 attribute");
-            }
             uint32_t i1, i2, i3;
             try {
                 i1 = static_cast<uint32_t>(std::stoul(sv1));
@@ -227,32 +346,198 @@ Mesh read_3mf(const std::filesystem::path& path) {
                 throw ThreeMfError(std::string("invalid triangle index: ") + e.what());
             }
             const uint32_t vcount = static_cast<uint32_t>(mesh.vertices.size());
-            if (i1 >= vcount || i2 >= vcount || i3 >= vcount) {
+            if (i1 >= vcount || i2 >= vcount || i3 >= vcount)
                 throw ThreeMfError("triangle index out of range");
-            }
-            mesh.faces.push_back({i1, i2, i3});
+            mesh.faces.push_back({ i1, i2, i3 });
             pos = tag_end + 1;
         }
     }
-
     return mesh;
 }
 
+// Locate each <object id="N" type="model"> ... </object> block in the 3MF
+// XML, parse its <mesh>, and return one (id, name, mesh) tuple per object.
+// IDs and names are LOCAL to the XML (caller is responsible for any
+// remapping). For a 3MF with a single <object>, returns one entry. For
+// a multi-object 3MF (as produced by write_3mf_volumes), returns one
+// entry per object.
+struct ParsedObject {
+    int         id = 0;
+    std::string name;
+    Mesh        mesh;
+};
+static std::vector<ParsedObject> parse_3mf_objects(const std::string& xml) {
+    std::vector<ParsedObject> out;
+    size_t pos = 0;
+    while (pos < xml.size()) {
+        const size_t obj_open = xml.find("<object", pos);
+        if (obj_open == std::string::npos) break;
+        const size_t obj_tag_end = xml.find('>', obj_open);
+        if (obj_tag_end == std::string::npos) break;
+        const size_t obj_close = xml.find("</object>", obj_tag_end);
+        if (obj_close == std::string::npos) break;
+        const std::string tag = xml.substr(obj_open, obj_tag_end - obj_open + 1);
+        // Skip object refs (type="other" or components-only); we only want
+        // objects with a <mesh> inside.
+        const size_t mesh_open = xml.find("<mesh>", obj_tag_end);
+        if (mesh_open != std::string::npos && mesh_open < obj_close) {
+            ParsedObject po;
+            const std::string sid = get_attr(tag, "id");
+            if (!sid.empty()) {
+                try { po.id = std::stoi(sid); } catch (...) {}
+            }
+            po.name = get_attr(tag, "name");
+            po.mesh = parse_3mf_mesh_block(xml, obj_tag_end, obj_close);
+            out.push_back(std::move(po));
+        }
+        pos = obj_close + 1;
+    }
+    if (out.empty()) {
+        throw ThreeMfError("no <object> blocks with <mesh> in 3MF model");
+    }
+    return out;
+}
+
+// Load the 3D/3dmodel.model XML string from a 3MF archive.
+static std::string load_3mf_model_xml(const std::filesystem::path& path,
+                                      mz_zip_archive* keep_open = nullptr) {
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_file(&zip, path.string().c_str(), 0)) {
+        throw ThreeMfError("cannot open 3MF file: " + path.string());
+    }
+    int idx = mz_zip_reader_locate_file(&zip, "3D/3dmodel.model", nullptr, 0);
+    if (idx < 0) {
+        mz_zip_reader_end(&zip);
+        throw ThreeMfError("3D/3dmodel.model not found in archive");
+    }
+    size_t out_size = 0;
+    void* raw = mz_zip_reader_extract_to_heap(&zip,
+        static_cast<mz_uint>(idx), &out_size, 0);
+    if (keep_open) *keep_open = zip;
+    else mz_zip_reader_end(&zip);
+    if (!raw) {
+        if (keep_open) mz_zip_reader_end(keep_open);
+        throw ThreeMfError("failed to extract 3D/3dmodel.model");
+    }
+    std::string xml(static_cast<const char*>(raw), out_size);
+    mz_free(raw);
+    return xml;
+}
+
+Mesh read_3mf(const std::filesystem::path& path) {
+    const std::string xml = load_3mf_model_xml(path);
+    auto objects = parse_3mf_objects(xml);
+    // Concatenate all objects into one mesh, offsetting vertex indices.
+    Mesh out;
+    size_t total_v = 0, total_f = 0;
+    for (const auto& o : objects) {
+        total_v += o.mesh.vertices.size();
+        total_f += o.mesh.faces.size();
+    }
+    out.vertices.reserve(total_v);
+    out.faces.reserve(total_f);
+    for (const auto& o : objects) {
+        const uint32_t base = static_cast<uint32_t>(out.vertices.size());
+        out.vertices.insert(out.vertices.end(),
+            o.mesh.vertices.begin(), o.mesh.vertices.end());
+        for (const auto& f : o.mesh.faces) {
+            out.faces.push_back({ f[0] + base, f[1] + base, f[2] + base });
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
-// read_3mf_volumes — read 3MF and split into shells using Slic3r metadata
+// read_3mf_volumes — read 3MF and split into shells
 // ---------------------------------------------------------------------------
 //
-// Multi-color / multi-part 3MFs from PrusaSlicer pack several physical
-// shells into one <object> in the main model and put the per-shell
-// triangle-index partition into Metadata/Slic3r_PE_model.config (a
-// Slic3r-specific extension). Reading this metadata gives a CLEAN shell
-// partition without any geometric guessing — the slicer already
-// identified the shells when the user authored the multi-part print.
+// Two paths handled:
 //
-// For 3MFs without Slic3r_PE_model.config or without <volume> blocks,
-// this falls back to a single volume covering the whole mesh.
+//   1) Multi-<object> 3MF (e.g. what write_3mf_volumes produces, or any
+//      conforming multi-object 3MF): each <object> becomes its own
+//      ThreeMfVolume. The name is the object's `name` attribute (if any).
+//      If Metadata/Slic3r_PE_model.config exists with a matching number
+//      of <volume> blocks, the names and extruders are taken from there.
+//
+//   2) Single-<object> 3MF with Slic3r_PE_model.config (PrusaSlicer's
+//      packing): everything is in one <object> with the per-shell
+//      triangle-index partition in `Metadata/Slic3r_PE_model.config` as
+//      `<volume firstid="N" lastid="M">` entries.
+//
+// For 3MFs without either form, falls back to a single volume covering
+// the whole mesh.
 std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
-    Mesh full = read_3mf(path);
+    // Parse all <object> blocks first; if there are multiple objects,
+    // they ARE the volumes (multi-object 3MF path).
+    const std::string xml = load_3mf_model_xml(path);
+    auto objects = parse_3mf_objects(xml);
+
+    // For the multi-object case, build volumes directly from objects.
+    if (objects.size() > 1) {
+        std::vector<ThreeMfVolume> out;
+        out.reserve(objects.size());
+        for (auto& o : objects) {
+            ThreeMfVolume tv;
+            tv.mesh = std::move(o.mesh);
+            tv.name = o.name;
+            tv.extruder = 0;
+            out.push_back(std::move(tv));
+        }
+        // Best-effort: if the file also has Slic3r_PE_model.config with the
+        // same number of <volume> entries, take names + extruders from
+        // there (so write_3mf_volumes round-trip preserves metadata).
+        mz_zip_archive z{};
+        if (mz_zip_reader_init_file(&z, path.string().c_str(), 0)) {
+            int cidx = mz_zip_reader_locate_file(&z,
+                "Metadata/Slic3r_PE_model.config", nullptr, 0);
+            if (cidx >= 0) {
+                size_t cs = 0;
+                void* craw = mz_zip_reader_extract_to_heap(&z,
+                    static_cast<mz_uint>(cidx), &cs, 0);
+                if (craw) {
+                    std::string cfg(static_cast<const char*>(craw), cs);
+                    mz_free(craw);
+                    std::vector<std::pair<std::string, int>> meta;
+                    size_t pos = 0;
+                    while (pos < cfg.size()) {
+                        const size_t vo = cfg.find("<volume ", pos);
+                        if (vo == std::string::npos) break;
+                        const size_t ve = cfg.find("</volume>", vo);
+                        if (ve == std::string::npos) break;
+                        const std::string body = cfg.substr(vo, ve - vo);
+                        std::string nm; int ex = 0;
+                        size_t mp = 0;
+                        while (mp < body.size()) {
+                            const size_t mo = body.find("<metadata", mp);
+                            if (mo == std::string::npos) break;
+                            const size_t me = body.find("/>", mo);
+                            if (me == std::string::npos) break;
+                            const std::string mtag = body.substr(mo, me - mo + 2);
+                            const std::string k = get_attr(mtag, "key");
+                            const std::string v = get_attr(mtag, "value");
+                            if (k == "name") nm = v;
+                            else if (k == "extruder") { try { ex = std::stoi(v); } catch (...) {} }
+                            mp = me + 2;
+                        }
+                        meta.emplace_back(nm, ex);
+                        pos = ve + 1;
+                    }
+                    if (meta.size() == out.size()) {
+                        for (size_t i = 0; i < out.size(); ++i) {
+                            if (out[i].name.empty()) out[i].name = meta[i].first;
+                            out[i].extruder = meta[i].second;
+                        }
+                    }
+                }
+            }
+            mz_zip_reader_end(&z);
+        }
+        return out;
+    }
+
+    // Single-object path: concat the (only) object to one Mesh and look
+    // for Slic3r_PE_model.config volume ranges within it.
+    Mesh full = std::move(objects.front().mesh);
     const uint32_t total_faces = static_cast<uint32_t>(full.faces.size());
 
     // Re-open the archive to look for Slic3r_PE_model.config.

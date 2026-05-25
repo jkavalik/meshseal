@@ -34,4 +34,21 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path);
 // Write mesh as minimal 3MF. Coordinates written as full-precision decimal strings.
 void write_3mf(const Mesh& mesh, const std::filesystem::path& path);
 
+// Write a multi-volume 3MF: separate <object> per ThreeMfVolume, each
+// with its own <vertices>/<triangles>. The <build> section lists all
+// objects so a slicer sees them as physically distinct bodies.
+//
+// This is the lossless multi-volume output format — preserves the per-
+// shell separation the way PrusaSlicer's "Fix by Windows repair" round-
+// trip does. STL output of multi-volume meshes is lossy (positional
+// welding on re-read merges shared boundaries); this is not.
+//
+// When write_slic3r_config is true, also writes
+// Metadata/Slic3r_PE_model.config so re-reading the file with
+// read_3mf_volumes recovers the same partition. The triangle ranges
+// (firstid/lastid) are computed by concatenating the volumes in order.
+void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
+                       const std::filesystem::path& path,
+                       bool write_slic3r_config = true);
+
 } // namespace meshseal
