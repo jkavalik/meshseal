@@ -1,8 +1,10 @@
 #include "3mf_io.h"
 #include <miniz.h>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -234,6 +236,129 @@ Mesh read_3mf(const std::filesystem::path& path) {
     }
 
     return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// read_3mf_volumes — read 3MF and split into shells using Slic3r metadata
+// ---------------------------------------------------------------------------
+//
+// Multi-color / multi-part 3MFs from PrusaSlicer pack several physical
+// shells into one <object> in the main model and put the per-shell
+// triangle-index partition into Metadata/Slic3r_PE_model.config (a
+// Slic3r-specific extension). Reading this metadata gives a CLEAN shell
+// partition without any geometric guessing — the slicer already
+// identified the shells when the user authored the multi-part print.
+//
+// For 3MFs without Slic3r_PE_model.config or without <volume> blocks,
+// this falls back to a single volume covering the whole mesh.
+std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
+    Mesh full = read_3mf(path);
+    const uint32_t total_faces = static_cast<uint32_t>(full.faces.size());
+
+    // Re-open the archive to look for Slic3r_PE_model.config.
+    struct VolRange { uint32_t firstid, lastid; std::string name; int extruder; };
+    std::vector<VolRange> ranges;
+
+    mz_zip_archive zip{};
+    if (mz_zip_reader_init_file(&zip, path.string().c_str(), 0)) {
+        int idx = mz_zip_reader_locate_file(&zip,
+            "Metadata/Slic3r_PE_model.config", nullptr, 0);
+        if (idx >= 0) {
+            size_t out_size = 0;
+            void* raw = mz_zip_reader_extract_to_heap(&zip,
+                static_cast<mz_uint>(idx), &out_size, 0);
+            if (raw) {
+                std::string cfg(static_cast<const char*>(raw), out_size);
+                mz_free(raw);
+
+                // Parse each <volume firstid="N" lastid="M"> ... </volume>
+                size_t pos = 0;
+                while (pos < cfg.size()) {
+                    const size_t vol_open = cfg.find("<volume ", pos);
+                    if (vol_open == std::string::npos) break;
+                    const size_t open_end = cfg.find('>', vol_open);
+                    if (open_end == std::string::npos) break;
+                    const size_t vol_close = cfg.find("</volume>", open_end);
+                    if (vol_close == std::string::npos) break;
+                    const std::string open_tag =
+                        cfg.substr(vol_open, open_end - vol_open + 1);
+                    const std::string body =
+                        cfg.substr(open_end + 1, vol_close - open_end - 1);
+                    const std::string sf = get_attr(open_tag, "firstid");
+                    const std::string sl = get_attr(open_tag, "lastid");
+                    if (!sf.empty() && !sl.empty()) {
+                        VolRange vr;
+                        try {
+                            vr.firstid = static_cast<uint32_t>(std::stoul(sf));
+                            vr.lastid  = static_cast<uint32_t>(std::stoul(sl));
+                        } catch (...) {
+                            pos = vol_close + 1; continue;
+                        }
+                        // name + extruder inside <metadata key="name|extruder" value="...">
+                        size_t mp = 0;
+                        while (mp < body.size()) {
+                            const size_t mo = body.find("<metadata", mp);
+                            if (mo == std::string::npos) break;
+                            const size_t me = body.find("/>", mo);
+                            if (me == std::string::npos) break;
+                            const std::string mtag =
+                                body.substr(mo, me - mo + 2);
+                            const std::string k = get_attr(mtag, "key");
+                            const std::string v = get_attr(mtag, "value");
+                            if (k == "name") vr.name = v;
+                            else if (k == "extruder") {
+                                try { vr.extruder = std::stoi(v); }
+                                catch (...) {}
+                            }
+                            mp = me + 2;
+                        }
+                        // Sanity: bound to actual face count; skip degenerate
+                        if (vr.lastid < total_faces && vr.firstid <= vr.lastid)
+                            ranges.push_back(std::move(vr));
+                    }
+                    pos = vol_close + 1;
+                }
+            }
+        }
+        mz_zip_reader_end(&zip);
+    }
+
+    // Fallback: no metadata or no parseable volumes → single volume.
+    if (ranges.empty()) {
+        ThreeMfVolume tv;
+        tv.mesh = std::move(full);
+        tv.name = "";
+        tv.extruder = 0;
+        return { std::move(tv) };
+    }
+
+    // Build one Mesh per volume by extracting the face range and
+    // re-mapping vertex indices (each volume gets its own vertex pool).
+    std::vector<ThreeMfVolume> out;
+    out.reserve(ranges.size());
+    for (const auto& vr : ranges) {
+        ThreeMfVolume tv;
+        tv.name = vr.name;
+        tv.extruder = vr.extruder;
+        std::vector<uint32_t> remap(full.vertices.size(),
+                                    std::numeric_limits<uint32_t>::max());
+        tv.mesh.faces.reserve(vr.lastid - vr.firstid + 1);
+        for (uint32_t fi = vr.firstid; fi <= vr.lastid; ++fi) {
+            const auto& src = full.faces[fi];
+            std::array<uint32_t, 3> nf;
+            for (int k = 0; k < 3; ++k) {
+                uint32_t sv = src[k];
+                if (remap[sv] == std::numeric_limits<uint32_t>::max()) {
+                    remap[sv] = static_cast<uint32_t>(tv.mesh.vertices.size());
+                    tv.mesh.vertices.push_back(full.vertices[sv]);
+                }
+                nf[k] = remap[sv];
+            }
+            tv.mesh.faces.push_back(nf);
+        }
+        out.push_back(std::move(tv));
+    }
+    return out;
 }
 
 } // namespace meshseal

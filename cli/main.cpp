@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const auto result = meshseal::repair(mesh);
+    meshseal::RepairResult result = meshseal::repair(mesh);
 
     if (result.partial_failure) {
         std::cerr << "warning: repair partially failed\n";
