@@ -23,6 +23,8 @@
 #include "stages/nm_local_repair.h"
 #include "stages/nm_carve_refill.h"
 #include "stages/coplanar_fan_drop.h"
+#include "stages/orient_wn.h"
+#include "stages/strip_doubled_membrane.h"
 #include "stl_io.h"
 #include <algorithm>
 #include <cmath>
@@ -286,6 +288,44 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // the time, get clean output.
     constexpr size_t kReconstructSoupMaxFaces = 800000;
     constexpr size_t kHugeCleanupMaxFaces     = 1200000;
+
+    // --- Stage: strip_doubled_membrane (pre-weld) ---
+    //
+    // Drop wholesale internal doubled-membrane structures BEFORE weld
+    // collapses the two sheets' coincident vertices into shared indices.
+    //
+    // Why pre-weld: the membrane pattern is two back-to-back face sheets
+    // with antiparallel normals at near-identical positions. Pre-weld, each
+    // face has unique vertex indices and the proximity-pair check is a
+    // clean geometric test on centroids. Post-weld, the two sheets share
+    // vertices and `degenerate` (which removes canonical-sort duplicate
+    // faces) already eats half the pattern; the residual mismatched-
+    // triangulation portions don't reach the 10 % trigger gate.
+    //
+    // GATED. Adopted only when the detected antipar+proximity pair set is
+    // >= 10 % of total faces AND total faces >= 100 -- the signature of a
+    // multi-shell export where bodies were left touching. Smaller localised
+    // doubled patches (trumpet's 3 % annular seam) fall below the gate and
+    // continue through the existing collapse_nm pipeline. Tiny meshes
+    // (synthetic test fixtures with 2-24 faces) never trigger.
+    //
+    // Discovered via the Bee_v3 investigation (2026-05-26): input
+    // F=137588 nm=82924 antipar=31 -> baseline output F=78920 nm=44
+    // antipar=1074 (and c=2 fragmented). With strip: F~23000 nm=0 c=1
+    // antipar~22, volume matches the sum of per-shell input volumes.
+    if (!result.mesh.faces.empty()) {
+        internal::ScopedTimer t("strip_doubled_membrane", result.stage_times_ms);
+        auto strip = stages::strip_doubled_membrane(result.mesh);
+        if (strip.applied) {
+            result.mesh = std::move(strip.mesh);
+            result.stages_applied.push_back("strip_doubled_membrane");
+            result.notes.push_back("strip_doubled_membrane: removed " +
+                std::to_string(strip.faces_removed) + " faces (" +
+                std::to_string(strip.pairs_found) + " antipar pairs, " +
+                std::to_string((100u * strip.faces_removed) / std::max<uint32_t>(strip.total_faces, 1u)) +
+                "% of input)");
+        }
+    }
 
     // --- Stage: weld ---
     if (opts.weld && !result.mesh.vertices.empty()) {
@@ -2410,6 +2450,33 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 for (const auto& n : inner.notes)
                     result.notes.push_back("[cfd-recursed] " + n);
             }
+        }
+    }
+
+    // --- GWN-based per-face orientation correction ---
+    // After all topological repair stages, a mesh that's CLEAN by basic
+    // check may still have an inverted-normal stripe (faces locally
+    // pointing inward instead of outward; surface is topologically
+    // watertight but locally inverted). orient_by_winding_number uses:
+    //   - Patch BFS: split mesh by manifold-edges-with-parallel-winding
+    //     (antipar edges are patch boundaries, not patch-internal).
+    //   - Per-face RELATIVE GWN comparison with majority-vote within
+    //     each patch: face is inverted iff GWN(c + epsilon * N) >
+    //     GWN(c - epsilon * N).
+    //   - Adopt only when antipar count strictly decreases AND the
+    //     mesh's total signed volume sign doesn't flip (catches the
+    //     Bee_v3-vol[3] failure mode where the naive algorithm wanted
+    //     to flip 99% of the main patch).
+    if (!result.mesh.faces.empty()) {
+        auto rwn = stages::orient_by_winding_number(result.mesh, 50, 1000000);
+        if (rwn.applied) {
+            result.mesh = std::move(rwn.mesh);
+            add_stage("orient_wn");
+            result.notes.push_back("orient_wn: flipped " +
+                std::to_string(rwn.faces_flipped) +
+                " faces (antipar " +
+                std::to_string(rwn.antipar_before) + " -> " +
+                std::to_string(rwn.antipar_after) + ")");
         }
     }
 

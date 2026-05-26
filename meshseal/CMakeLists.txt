@@ -26,6 +26,9 @@ add_library(meshseal STATIC
     src/stages/si_split.cpp
     src/stages/nm_carve_refill.cpp
     src/stages/coplanar_fan_drop.cpp
+    src/stages/orient_wn.cpp
+    src/stages/strip_doubled_membrane.cpp
+    src/internal/winding_number.cpp
     src/internal/halfedge.cpp
     src/internal/bvh.cpp
     src/internal/diagnostics.cpp
