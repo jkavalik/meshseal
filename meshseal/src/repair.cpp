@@ -505,6 +505,52 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     std::to_string(comps.size()) + " input components -> " +
                     std::to_string(clusters.size()) + " AABB-disjoint clusters, "
                     "repaired independently");
+                // Post-merge nm_carve_refill: each cluster ran its own
+                // pipeline (including its own carve_refill loop) but residual
+                // nm=1-5 in a single cluster can survive when the carve+refill
+                // result rejects (no strict improvement). On the merged
+                // result, running nm_carve_refill once more sometimes pushes
+                // the stuck cluster to CLEAN — the carve targets exactly the
+                // NM-incident faces of the merged mesh, and the recursive
+                // repair() on the carved patch settles it.
+                //
+                // Gated to small residuals (nm<=20, same as the main loop)
+                // and depth+1 to prevent infinite recursion via recursive
+                // spatial_split nesting. Snorlax vol[2] motivation: cluster 8
+                // produces nm=1 that survives the cluster's own carve_refill
+                // (refill didn't strictly improve), but a fresh carve on the
+                // merged mesh + one more recursion clears it.
+                if (opts.allow_carve_refill &&
+                    opts.recursion_depth < 2 &&
+                    !result.mesh.faces.empty()) {
+                    auto post_merge = cached_diag(result.mesh);
+                    constexpr uint32_t kCarveMaxNm = 20u;
+                    if (post_merge.non_manifold_edges > 0 &&
+                        post_merge.non_manifold_edges <= kCarveMaxNm) {
+                        auto cr = stages::nm_carve_refill(result.mesh, /*halo_rings=*/1);
+                        if (cr.applied && cr.faces_carved > 0) {
+                            RepairOptions nested = opts;
+                            nested.recursion_depth   = opts.recursion_depth + 1;
+                            nested.allow_carve_refill = false;
+                            nested.allow_spatial_split = false;
+                            RepairResult inner = repair(cr.mesh, nested);
+                            auto post = cached_diag(inner.mesh);
+                            const double v0 = std::abs(post_merge.signed_volume);
+                            const double dv = std::abs(post.signed_volume - post_merge.signed_volume);
+                            const bool vol_ok = (v0 < 1e-300) || (dv <= 0.20 * v0);
+                            if (post.non_manifold_edges < post_merge.non_manifold_edges &&
+                                post.open_boundary_edges == 0 && vol_ok) {
+                                result.mesh = std::move(inner.mesh);
+                                result.notes.push_back("post_split_carve_refill: nm " +
+                                    std::to_string(post_merge.non_manifold_edges) + " -> " +
+                                    std::to_string(post.non_manifold_edges));
+                                if (post.non_manifold_edges == 0 && post.open_boundary_edges == 0) {
+                                    all_watertight = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 result.watertight        = all_watertight;
                 result.is_volume         = all_volume;
                 result.component_count   = total_components;
