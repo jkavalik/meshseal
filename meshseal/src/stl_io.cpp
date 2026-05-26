@@ -43,6 +43,10 @@ static void write_u32_le(uint8_t* p, uint32_t v) {
 // Tolerant of arbitrary whitespace/indentation and ignores the normal,
 // `facet`/`loop`/`endloop`/`endfacet`/`endsolid` keywords.
 static Mesh read_stl_ascii(const uint8_t* data, size_t size) {
+    // Match the binary STL cap so an attacker can't bypass the binary cap
+    // by including a "solid" prefix and routing into the ASCII path.
+    // 100M triangles = 300M vertex records.
+    constexpr size_t kMaxAsciiVerts = 300'000'000u;
     std::string text(reinterpret_cast<const char*>(data), size);
     std::istringstream ss(text);
     std::string tok;
@@ -55,6 +59,9 @@ static Mesh read_stl_ascii(const uint8_t* data, size_t size) {
             }
             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
                 throw StlError("NaN/Inf vertex in ASCII STL");
+            }
+            if (verts.size() >= kMaxAsciiVerts) {
+                throw StlError("ASCII STL vertex count exceeds 300M cap");
             }
             verts.push_back({x, y, z});
         }

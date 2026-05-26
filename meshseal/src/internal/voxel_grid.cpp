@@ -20,14 +20,37 @@ VoxelGrid::VoxelGrid(const std::array<double, 3>& lo,
     if (cell_ <= 0.0) cell_ = 1e-9;
 
     // 2-cell padding so the entire grid boundary is exterior.
+    // Guard each axis: if hi < lo (degenerate / NaN-derived), substitute
+    // a unit extent. Without this, sz can be negative and `ceil(neg/cell)`
+    // casts to a huge uint32_t → enormous allocation.
     for (int k = 0; k < 3; ++k) {
+        const double ext_k = (hi[k] > lo[k]) ? (hi[k] - lo[k]) : 0.0;
         lo_[k] = lo[k] - 2.0 * cell_;
-        const double sz = (hi[k] + 2.0 * cell_) - lo_[k];
-        dim_[k] = std::max<std::uint32_t>(
+        const double sz = ext_k + 4.0 * cell_;
+        std::uint32_t d = std::max<std::uint32_t>(
             4, static_cast<std::uint32_t>(std::ceil(sz / cell_)));
+        // Per-axis safety cap. 4096 cells/axis is more than any practical
+        // mesh needs; combined with the product cap below this prevents
+        // runaway allocation on pathological aspect ratios.
+        if (d > 4096u) d = 4096u;
+        dim_[k] = d;
     }
-    labels_.assign(static_cast<std::size_t>(dim_[0]) * dim_[1] * dim_[2],
-                   Label::Inside);
+    // Product cap: a degenerate aspect ratio could still combine three
+    // 4096s into 68 GB of Label-bytes. Cap the product at 1 GiB cells.
+    // Falls back to a uniform coarser grid by halving the largest dim
+    // until under cap.
+    constexpr std::size_t kMaxCells = 1ull << 30; // 1 GiB cells
+    std::size_t total = static_cast<std::size_t>(dim_[0]) * dim_[1] * dim_[2];
+    while (total > kMaxCells) {
+        int kmax = 0;
+        if (dim_[1] > dim_[kmax]) kmax = 1;
+        if (dim_[2] > dim_[kmax]) kmax = 2;
+        if (dim_[kmax] <= 8u) break; // can't go below floor
+        dim_[kmax] /= 2u;
+        cell_ *= 2.0;
+        total = static_cast<std::size_t>(dim_[0]) * dim_[1] * dim_[2];
+    }
+    labels_.assign(total, Label::Inside);
 }
 
 void VoxelGrid::rasterize(const std::array<double, 3>& a,

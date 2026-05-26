@@ -1,6 +1,7 @@
 #include "intersections.h"
 #include <manifold/manifold.h>
 #include <cstdint>
+#include <exception>
 #include <vector>
 
 namespace meshseal::stages {
@@ -11,6 +12,14 @@ IntersectResult resolve_intersections(const Mesh& mesh) {
     result.faces_after  = result.faces_before;
     result.had_intersections = false;
     result.manifold_failed   = false;
+
+    // Wrap the entire manifold-library interaction in a try/catch. Manifold
+    // is documented to throw on some pathological inputs (very-large coords
+    // and NaN cases that survive Phase 0); a throw here would propagate up
+    // through every outer repair() frame and abort the whole pipeline.
+    // Treat any throw the same as `manifold_failed`: return the original
+    // mesh unchanged, caller's defect guards reject the no-op.
+    try {
 
     // Build MeshGL from input Mesh
     manifold::MeshGL mesh_gl;
@@ -111,6 +120,15 @@ IntersectResult resolve_intersections(const Mesh& mesh) {
     result.had_intersections = (result.faces_before != result.faces_after);
     result.mesh              = std::move(out_mesh);
     return result;
+    } catch (const std::exception&) {
+        result.manifold_failed = true;
+        result.mesh = mesh;
+        return result;
+    } catch (...) {
+        result.manifold_failed = true;
+        result.mesh = mesh;
+        return result;
+    }
 }
 
 } // namespace meshseal::stages

@@ -1,15 +1,55 @@
 #include "3mf_io.h"
 #include <miniz.h>
 #include <array>
+#include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace meshseal {
+
+// ---------------------------------------------------------------------------
+// Locale-independent numeric parsers.
+//
+// `std::stod` / `std::stoi` / `std::stoul` honour the C locale: on Czech /
+// German Windows, decimal separator is `,` and `std::stod("1.5")` parses
+// as `1`. The 3MF spec mandates `.` as the decimal separator, so the
+// reader MUST be locale-insensitive. `std::from_chars` is the right tool.
+// ---------------------------------------------------------------------------
+
+static bool parse_double(const std::string& s, double& out) {
+    if (s.empty()) return false;
+    const char* first = s.data();
+    const char* last  = s.data() + s.size();
+    auto r = std::from_chars(first, last, out);
+    return r.ec == std::errc() && r.ptr == last;
+}
+
+static bool parse_uint32(const std::string& s, uint32_t& out) {
+    if (s.empty()) return false;
+    const char* first = s.data();
+    const char* last  = s.data() + s.size();
+    unsigned long long tmp = 0;
+    auto r = std::from_chars(first, last, tmp);
+    if (r.ec != std::errc() || r.ptr != last) return false;
+    if (tmp > std::numeric_limits<uint32_t>::max()) return false;
+    out = static_cast<uint32_t>(tmp);
+    return true;
+}
+
+static bool parse_int(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    const char* first = s.data();
+    const char* last  = s.data() + s.size();
+    auto r = std::from_chars(first, last, out);
+    return r.ec == std::errc() && r.ptr == last;
+}
 
 // ---------------------------------------------------------------------------
 // Internal XML helpers
@@ -300,6 +340,12 @@ static Mesh parse_3mf_mesh_block(const std::string& xml,
         throw ThreeMfError("missing <vertices>/<triangles> in 3MF <mesh> block");
     }
 
+    // Caps on count to bound parser work and downstream allocations even
+    // when the model XML is within the 256 MB zip-bomb extraction cap.
+    // 100M each is generous (every meshseal-known fixture is <2M).
+    constexpr size_t kMaxParseVerts = 100'000'000u;
+    constexpr size_t kMaxParseTris  = 100'000'000u;
+
     Mesh mesh;
     // <vertex>
     {
@@ -315,11 +361,14 @@ static Mesh parse_3mf_mesh_block(const std::string& xml,
             const std::string sz = get_attr(tag, "z");
             if (sx.empty() || sy.empty() || sz.empty())
                 throw ThreeMfError("vertex tag missing x/y/z attribute");
-            try {
-                mesh.vertices.push_back({ std::stod(sx), std::stod(sy), std::stod(sz) });
-            } catch (const std::exception& e) {
-                throw ThreeMfError(std::string("invalid vertex coordinate: ") + e.what());
-            }
+            double dx = 0, dy = 0, dz = 0;
+            if (!parse_double(sx, dx) || !parse_double(sy, dy) || !parse_double(sz, dz))
+                throw ThreeMfError("invalid vertex coordinate (non-numeric)");
+            if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz))
+                throw ThreeMfError("NaN/Inf vertex coordinate");
+            if (mesh.vertices.size() >= kMaxParseVerts)
+                throw ThreeMfError("3MF vertex count exceeds 100M cap");
+            mesh.vertices.push_back({ dx, dy, dz });
             pos = tag_end + 1;
         }
     }
@@ -337,17 +386,14 @@ static Mesh parse_3mf_mesh_block(const std::string& xml,
             const std::string sv3 = get_attr(tag, "v3");
             if (sv1.empty() || sv2.empty() || sv3.empty())
                 throw ThreeMfError("triangle tag missing v1/v2/v3 attribute");
-            uint32_t i1, i2, i3;
-            try {
-                i1 = static_cast<uint32_t>(std::stoul(sv1));
-                i2 = static_cast<uint32_t>(std::stoul(sv2));
-                i3 = static_cast<uint32_t>(std::stoul(sv3));
-            } catch (const std::exception& e) {
-                throw ThreeMfError(std::string("invalid triangle index: ") + e.what());
-            }
+            uint32_t i1 = 0, i2 = 0, i3 = 0;
+            if (!parse_uint32(sv1, i1) || !parse_uint32(sv2, i2) || !parse_uint32(sv3, i3))
+                throw ThreeMfError("invalid triangle index (non-numeric or out-of-range)");
             const uint32_t vcount = static_cast<uint32_t>(mesh.vertices.size());
             if (i1 >= vcount || i2 >= vcount || i3 >= vcount)
                 throw ThreeMfError("triangle index out of range");
+            if (mesh.faces.size() >= kMaxParseTris)
+                throw ThreeMfError("3MF triangle count exceeds 100M cap");
             mesh.faces.push_back({ i1, i2, i3 });
             pos = tag_end + 1;
         }
@@ -384,7 +430,8 @@ static std::vector<ParsedObject> parse_3mf_objects(const std::string& xml) {
             ParsedObject po;
             const std::string sid = get_attr(tag, "id");
             if (!sid.empty()) {
-                try { po.id = std::stoi(sid); } catch (...) {}
+                int idv = 0;
+                if (parse_int(sid, idv)) po.id = idv;
             }
             po.name = get_attr(tag, "name");
             po.mesh = parse_3mf_mesh_block(xml, obj_tag_end, obj_close);
@@ -398,6 +445,13 @@ static std::vector<ParsedObject> parse_3mf_objects(const std::string& xml) {
     return out;
 }
 
+// Zip-bomb guard: reject 3MF archives whose declared uncompressed size for
+// the model XML or slicer config exceeds these caps. A 1KB malicious 3MF
+// can otherwise advertise a 10GB uncompressed entry and force allocation
+// of the full size during extract_to_heap.
+static constexpr mz_uint64 kMaxModelXmlUncompressed   = 256ull * 1024 * 1024; // 256 MB
+static constexpr mz_uint64 kMaxSlicerConfigUncompressed =       1 * 1024 * 1024; //   1 MB
+
 // Load the 3D/3dmodel.model XML string from a 3MF archive.
 static std::string load_3mf_model_xml(const std::filesystem::path& path,
                                       mz_zip_archive* keep_open = nullptr) {
@@ -409,6 +463,16 @@ static std::string load_3mf_model_xml(const std::filesystem::path& path,
     if (idx < 0) {
         mz_zip_reader_end(&zip);
         throw ThreeMfError("3D/3dmodel.model not found in archive");
+    }
+    // Zip-bomb guard: check the declared uncompressed size before extraction.
+    mz_zip_archive_file_stat stat{};
+    if (!mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(idx), &stat)) {
+        mz_zip_reader_end(&zip);
+        throw ThreeMfError("cannot stat 3D/3dmodel.model entry");
+    }
+    if (stat.m_uncomp_size > kMaxModelXmlUncompressed) {
+        mz_zip_reader_end(&zip);
+        throw ThreeMfError("3D/3dmodel.model uncompressed size exceeds 256 MB cap");
     }
     size_t out_size = 0;
     void* raw = mz_zip_reader_extract_to_heap(&zip,
@@ -491,9 +555,14 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
             int cidx = mz_zip_reader_locate_file(&z,
                 "Metadata/Slic3r_PE_model.config", nullptr, 0);
             if (cidx >= 0) {
+                // Zip-bomb guard for slicer config.
+                mz_zip_archive_file_stat cstat{};
+                bool stat_ok = mz_zip_reader_file_stat(&z,
+                    static_cast<mz_uint>(cidx), &cstat) &&
+                    cstat.m_uncomp_size <= kMaxSlicerConfigUncompressed;
                 size_t cs = 0;
-                void* craw = mz_zip_reader_extract_to_heap(&z,
-                    static_cast<mz_uint>(cidx), &cs, 0);
+                void* craw = stat_ok ? mz_zip_reader_extract_to_heap(&z,
+                    static_cast<mz_uint>(cidx), &cs, 0) : nullptr;
                 if (craw) {
                     std::string cfg(static_cast<const char*>(craw), cs);
                     mz_free(craw);
@@ -516,7 +585,7 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
                             const std::string k = get_attr(mtag, "key");
                             const std::string v = get_attr(mtag, "value");
                             if (k == "name") nm = v;
-                            else if (k == "extruder") { try { ex = std::stoi(v); } catch (...) {} }
+                            else if (k == "extruder") { int ev = 0; if (parse_int(v, ev)) ex = ev; }
                             mp = me + 2;
                         }
                         meta.emplace_back(nm, ex);
@@ -549,9 +618,14 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
         int idx = mz_zip_reader_locate_file(&zip,
             "Metadata/Slic3r_PE_model.config", nullptr, 0);
         if (idx >= 0) {
+            // Zip-bomb guard for slicer config.
+            mz_zip_archive_file_stat sstat{};
+            const bool sstat_ok = mz_zip_reader_file_stat(&zip,
+                static_cast<mz_uint>(idx), &sstat) &&
+                sstat.m_uncomp_size <= kMaxSlicerConfigUncompressed;
             size_t out_size = 0;
-            void* raw = mz_zip_reader_extract_to_heap(&zip,
-                static_cast<mz_uint>(idx), &out_size, 0);
+            void* raw = sstat_ok ? mz_zip_reader_extract_to_heap(&zip,
+                static_cast<mz_uint>(idx), &out_size, 0) : nullptr;
             if (raw) {
                 std::string cfg(static_cast<const char*>(raw), out_size);
                 mz_free(raw);
@@ -573,10 +647,8 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
                     const std::string sl = get_attr(open_tag, "lastid");
                     if (!sf.empty() && !sl.empty()) {
                         VolRange vr;
-                        try {
-                            vr.firstid = static_cast<uint32_t>(std::stoul(sf));
-                            vr.lastid  = static_cast<uint32_t>(std::stoul(sl));
-                        } catch (...) {
+                        if (!parse_uint32(sf, vr.firstid) ||
+                            !parse_uint32(sl, vr.lastid)) {
                             pos = vol_close + 1; continue;
                         }
                         // name + extruder inside <metadata key="name|extruder" value="...">
@@ -592,8 +664,8 @@ std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path) {
                             const std::string v = get_attr(mtag, "value");
                             if (k == "name") vr.name = v;
                             else if (k == "extruder") {
-                                try { vr.extruder = std::stoi(v); }
-                                catch (...) {}
+                                int ev = 0;
+                                if (parse_int(v, ev)) vr.extruder = ev;
                             }
                             mp = me + 2;
                         }

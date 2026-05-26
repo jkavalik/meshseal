@@ -38,8 +38,14 @@ double generalized_winding_number(const Mesh& mesh,
                                   const std::array<double, 3>& p)
 {
     constexpr double kInv4Pi = 1.0 / (4.0 * 3.14159265358979323846);
+    const size_t nv = mesh.vertices.size();
     double sum = 0.0;
     for (const auto& f : mesh.faces) {
+        // Defensive: skip any face whose indices are out of range. Public
+        // repair() Phase 0 validates this for normal callers, but this
+        // function is also reachable via `orient_wn` which calls it O(F²)
+        // times — one tainted face would silently UB across every query.
+        if (f[0] >= nv || f[1] >= nv || f[2] >= nv) continue;
         sum += tri_solid_angle(mesh.vertices[f[0]],
                                mesh.vertices[f[1]],
                                mesh.vertices[f[2]], p);

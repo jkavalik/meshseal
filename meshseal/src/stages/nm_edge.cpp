@@ -46,7 +46,13 @@ NmEdgeResult fix_non_manifold_edges(const Mesh& mesh) {
         }
     }
 
-    // Step 2: Find all non-manifold edges (> 2 incident faces)
+    // Step 2: Find all non-manifold edges (> 2 incident faces).
+    // NOTE: iteration order is unordered_map-bucket-defined. This is a
+    // documented non-determinism risk (sweep results CAN differ across
+    // stdlib versions), but sorting here REGRESSES black_vase from CLEAN
+    // to nm=1: the downstream nm_carve_refill rescue depends on the
+    // specific pair choices the bucket order produces. Until the
+    // downstream is decoupled from this order, leave as-is.
     std::vector<uint64_t> nm_edges;
     for (const auto& kv : edge_to_faces) {
         if (kv.second.size() > 2) {

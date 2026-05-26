@@ -105,6 +105,11 @@ NmLocalRepairResult nm_local_repair(const Mesh& mesh, double tol_rel) {
     }
     if (nm_endpoints.empty()) return result;
 
+    // NOTE: iteration is unordered_set-bucket-defined. Documented as a
+    // non-determinism risk. Sorting REGRESSES black_vase (rescue depends
+    // on specific merge survivor choice). Left as-is until downstream
+    // decoupling. See REVIEW_CHECKLIST Phase 3 reversion note.
+
     // Union-find for vertex merges. Always merge w → ep (the NM endpoint
     // is the survivor; w is the duplicate that gets absorbed).
     std::vector<uint32_t> uf(mesh.vertices.size());

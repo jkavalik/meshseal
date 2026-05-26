@@ -105,11 +105,21 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         // are conventionally mm. 1e9 is ~1000 km — anything past that is
         // certainly garbage, not a unit-scale mistake.
         const bool absurd_extent = bbd > 1e9;
-        if (bad_coord || absurd_extent) {
-            result.notes.push_back(
-                bad_coord
-                  ? "input rejected: NaN/Inf vertex coordinates (corrupt file)"
-                  : "input rejected: implausible geometry extent (corrupt file)");
+        // Library-API safety: callers may construct a Mesh{} programmatically
+        // and pass face indices that are out of range. Without this check
+        // every downstream stage's `mesh.vertices[face[k]]` is UB. Our STL/
+        // 3MF readers already validate; this protects the API boundary.
+        const size_t nv = mesh.vertices.size();
+        bool bad_face_index = false;
+        for (const auto& f : mesh.faces) {
+            if (f[0] >= nv || f[1] >= nv || f[2] >= nv) { bad_face_index = true; break; }
+        }
+        if (bad_coord || absurd_extent || bad_face_index) {
+            const char* reason =
+                bad_coord       ? "input rejected: NaN/Inf vertex coordinates (corrupt file)"
+              : absurd_extent   ? "input rejected: implausible geometry extent (corrupt file)"
+                                : "input rejected: face references out-of-range vertex index";
+            result.notes.push_back(reason);
             result.partial_failure = true;
             result.mesh.vertices.clear();
             result.mesh.faces.clear();
@@ -463,6 +473,12 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 // Extract each cluster as a sub-mesh, recurse, and combine.
                 RepairOptions sub_opts = opts;
                 sub_opts.allow_spatial_split = false;
+                // Increment recursion_depth so the global cap-of-2 is strict
+                // across spatial_split too. Per-cluster carve_refill recursion
+                // still has its own depth check; with this increment, the
+                // worst-case path is spatial_split (d=0) -> per-cluster (d=1)
+                // -> per-cluster's own carve_refill (d=2) -> reject further.
+                sub_opts.recursion_depth = opts.recursion_depth + 1;
                 std::vector<Mesh> sub_meshes;
                 bool   all_watertight = true;
                 bool   all_volume     = true;
@@ -544,9 +560,16 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                                 result.notes.push_back("post_split_carve_refill: nm " +
                                     std::to_string(post_merge.non_manifold_edges) + " -> " +
                                     std::to_string(post.non_manifold_edges));
-                                if (post.non_manifold_edges == 0 && post.open_boundary_edges == 0) {
-                                    all_watertight = true;
-                                }
+                                // Recompute aggregate flags from the NEW mesh,
+                                // not from per-cluster pre-adopt state. Without
+                                // this, all_watertight would still reflect the
+                                // stale pre-merge cluster aggregation.
+                                const bool nm_clean = (post.non_manifold_edges == 0 &&
+                                                       post.open_boundary_edges == 0);
+                                all_watertight = nm_clean;
+                                all_volume     = nm_clean &&
+                                                 std::abs(post.signed_volume) > 1e-12;
+                                total_components = static_cast<int>(post.component_count);
                             }
                         }
                     }

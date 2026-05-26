@@ -58,7 +58,14 @@ int main(int argc, char** argv) {
                               << " extruder=" << volumes[i].extruder
                               << " F=" << volumes[i].mesh.faces.size() << "\n";
                 }
-                auto sub = meshseal::repair(volumes[i].mesh);
+                meshseal::RepairResult sub;
+                try {
+                    sub = meshseal::repair(volumes[i].mesh);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: exception in repair() for volume "
+                              << i << ": " << e.what() << "\n";
+                    return 1;
+                }
                 if (sub.partial_failure) any_partial = true;
                 if (!quiet) {
                     for (const auto& n : sub.notes)
@@ -98,7 +105,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    meshseal::RepairResult result = meshseal::repair(mesh);
+    meshseal::RepairResult result;
+    try {
+        result = meshseal::repair(mesh);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: exception in repair(): " << e.what() << "\n";
+        return 1;
+    }
 
     if (result.partial_failure) {
         std::cerr << "warning: repair partially failed\n";

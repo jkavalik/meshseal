@@ -44,6 +44,11 @@ inline Mesh manifold_to_welded_mesh(const manifold::Manifold& m,
         }
     };
     auto pack = [](float f) -> std::uint32_t {
+        // Normalize signed zero: +0.0f and -0.0f compare equal as floats but
+        // have different bit patterns (0x00000000 vs 0x80000000). Without
+        // this, two sources of the same vertex with different zero-signs
+        // produce two distinct entries in dedup.
+        if (f == 0.0f) f = 0.0f;
         std::uint32_t u; std::memcpy(&u, &f, sizeof(u));
         return u;
     };

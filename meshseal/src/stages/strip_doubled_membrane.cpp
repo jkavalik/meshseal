@@ -104,7 +104,11 @@ StripDoubledMembraneResult strip_doubled_membrane(
 
     // Greedy pairing. For each face, query neighbours and pair with the
     // first unmarked antipar+close one. Visiting in face-index order is
-    // deterministic so the C++ result matches the Python prototype.
+    // deterministic; the neighbour list `nbrs` is unordered (hash bucket
+    // order). Sorting `nbrs` would make pair selection reproducible across
+    // builds but regresses Bee_v3.stl antipar (49 → 141) — the downstream
+    // pipeline's pair resolution is calibrated to the un-sorted choice.
+    // Documented determinism risk; left for a future careful re-calibration.
     std::vector<uint8_t> detected(F, 0);
     uint32_t pair_count = 0;
     const double tol2 = tol * tol;
