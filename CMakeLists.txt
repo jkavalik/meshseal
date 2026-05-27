@@ -1,9 +1,24 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.18)
 project(meshseal VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Build the FetchContent deps statically so the CLI / test binaries have
+# no runtime DLL dependencies. Without this:
+#   - Windows: catch_discover_tests fails with 0xc0000135 because
+#     tests_meshseal.exe can't find manifold.dll / miniz.dll at build time.
+#   - Linux/macOS: standalone meshseal_cli requires libmanifold.so / .dylib
+#     on LD_LIBRARY_PATH / DYLD_LIBRARY_PATH at runtime.
+# Static deps make every binary self-contained.
+set(BUILD_SHARED_LIBS OFF)
+
+# miniz 3.0.2 declares cmake_minimum_required(VERSION 3.0) at the top of
+# its own CMakeLists. CMake 4+ refuses any minimum below 3.5 unless this
+# policy-version cap is raised. Affects macOS runners that have shipped
+# CMake 4.x already and any contributor with a recent CMake install.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 include(CTest)
 
