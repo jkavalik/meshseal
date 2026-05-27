@@ -26,6 +26,12 @@ jobs:
             cc: gcc-10
             cxx: g++-10
             label: ubuntu-22.04 / gcc-10
+          # Older-Mac canary: macos-13 is the last x86_64 runner GitHub
+          # offers (macos-14+ are ARM64). One row gives both Intel-Mac
+          # ABI coverage and an older Apple Clang / libc++ — catches
+          # macOS regressions our arm64 macos-latest cannot see.
+          - os: macos-13
+            label: macos-13 (x86_64)
 
     runs-on: ${{ matrix.os }}
 
