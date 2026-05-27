@@ -1,5 +1,6 @@
 #include "3mf_io.h"
 #include <miniz.h>
+#include <fast_float/fast_float.h>
 #include <array>
 #include <charconv>
 #include <cmath>
@@ -27,7 +28,11 @@ static bool parse_double(const std::string& s, double& out) {
     if (s.empty()) return false;
     const char* first = s.data();
     const char* last  = s.data() + s.size();
-    auto r = std::from_chars(first, last, out);
+    // Use fast_float instead of std::from_chars: the C++17 fp overload is
+    // missing on Apple Clang's libc++ (explicitly = deleted) and on
+    // libstdc++ < 11 (GCC 9/10). fast_float ships the polyfill with the
+    // exact same API.
+    auto r = fast_float::from_chars(first, last, out);
     return r.ec == std::errc() && r.ptr == last;
 }
 

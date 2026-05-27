@@ -153,7 +153,7 @@ TEST_CASE("Intersections: two non-overlapping shells leave had_intersections fal
     CHECK(r.had_intersections == false);
 }
 
-TEST_CASE("Intersections: nested shells — inner cube absorbed into outer", "[intersections]") {
+TEST_CASE("Intersections: nested shells - inner cube absorbed into outer", "[intersections]") {
     // Boolean union of two nested solids equals the outer solid, because every
     // point of the inner is already inside the outer.  Represents the
     // matryoshka_nested / nested_shells fixture patterns.

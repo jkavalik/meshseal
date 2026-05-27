@@ -47,6 +47,8 @@ target_link_libraries(meshseal
     PUBLIC
         manifold
         miniz
+    PRIVATE
+        fast_float
 )
 
 target_compile_options(meshseal PRIVATE

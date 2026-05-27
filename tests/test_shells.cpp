@@ -59,7 +59,7 @@ TEST_CASE("Shells: dropped shell is not in output mesh", "[shells]") {
     CHECK(is_consistently_wound(r.mesh));
 }
 
-TEST_CASE("Shells: ShellInfo volume_threshold boundary — shell above 1% is kept", "[shells]") {
+TEST_CASE("Shells: ShellInfo volume_threshold boundary - shell above 1% is kept", "[shells]") {
     // Build a big cube (volume 1) and a small cube with volume > 0.01 (above 1% threshold).
     // With vol_threshold=0.01, the condition to drop is |vol| < 0.01 * max_vol.
     // s=0.22 → vol = 0.22^3 = 0.010648 > 0.01 → must be kept.

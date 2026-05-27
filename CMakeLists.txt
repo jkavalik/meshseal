@@ -38,6 +38,21 @@ FetchContent_Declare(
 )
 
 FetchContent_Declare(
+    fast_float
+    GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
+    GIT_TAG        v6.1.6
+    # Polyfill for std::from_chars<double>. The C++17 standard requires
+    # the floating-point overload, but real-world toolchains lag:
+    #   - GCC 9, 10: no double overload (compile error)
+    #   - libc++ in Apple Clang up through Xcode 16: overload explicitly
+    #     `= delete`d (compile error on macos-latest CI)
+    #   - libc++ < 14 on Linux: same issue
+    # fast_float is a header-only, MIT/Apache/BSL triple-licensed library
+    # that exposes fast_float::from_chars with the same API. The integer
+    # overload of std::from_chars is universally supported (we keep it).
+)
+
+FetchContent_Declare(
     miniz
     GIT_REPOSITORY https://github.com/richgel999/miniz.git
     GIT_TAG        3.0.2
@@ -60,7 +75,7 @@ set(MANIFOLD_EXPORT           OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(Catch2 manifold miniz)
+FetchContent_MakeAvailable(Catch2 manifold miniz fast_float)
 
 add_subdirectory(meshseal)
 add_subdirectory(cli)
