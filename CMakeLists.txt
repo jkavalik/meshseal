@@ -26,6 +26,15 @@ FetchContent_Declare(
     miniz
     GIT_REPOSITORY https://github.com/richgel999/miniz.git
     GIT_TAG        3.0.2
+    # NOTE on version reporting: the fetched miniz advertises three
+    # mutually-inconsistent version strings — `miniz.c 3.0.0` in the source
+    # header comment, `GIT_TAG 3.0.2` here, and `MZ_VERSION "11.0.2"` macro.
+    # This is upstream's idiosyncrasy (MZ_VERSION is legacy internal
+    # numbering that hasn't been bumped in years); the GIT_TAG is what
+    # actually pins the build. If supply-chain robustness becomes a
+    # concern, lock by commit SHA instead of tag string — `git ls-remote
+    # https://github.com/richgel999/miniz.git refs/tags/3.0.2` to obtain
+    # the SHA, then GIT_TAG <sha>.
 )
 
 set(MANIFOLD_TEST             OFF CACHE BOOL "" FORCE)

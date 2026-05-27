@@ -352,9 +352,16 @@ HoleFillResult fill_holes(const Mesh& input, uint32_t max_fan_size) {
         directed_edge_count[edge_key(f[0], f[1])]++;
         directed_edge_count[edge_key(f[1], f[2])]++;
         directed_edge_count[edge_key(f[2], f[0])]++;
-        directed_to_face[edge_key(f[0], f[1])] = fi;
-        directed_to_face[edge_key(f[1], f[2])] = fi;
-        directed_to_face[edge_key(f[2], f[0])] = fi;
+        // try_emplace = first-writer-wins for the directed-edge → face map.
+        // If two faces traverse the same directed edge (NM winding pattern),
+        // keep the first one's face index. The dihedral weighting that
+        // consumes this map is currently DISABLED (dihedral_score returns 0
+        // — see kDihedralWeight in this file). If re-enabled, the
+        // deterministic-first-writer choice is at least consistent across
+        // runs; previously, plain `=` silently picked the LAST writer.
+        directed_to_face.try_emplace(edge_key(f[0], f[1]), fi);
+        directed_to_face.try_emplace(edge_key(f[1], f[2]), fi);
+        directed_to_face.try_emplace(edge_key(f[2], f[0]), fi);
     }
 
     // boundary_outgoing[u] = vector of v's such that there are unpaired u->v

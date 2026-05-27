@@ -10,7 +10,15 @@ HalfEdgeMesh HalfEdgeMesh::build(const Mesh& mesh) {
     hm.half_edges.resize(nfaces * 3);
     hm.face_start.resize(nfaces);
 
-    // Step 1: create half-edges and populate edge_map
+    // Step 1: create half-edges and populate edge_map.
+    // Pre-condition: input mesh has no duplicate directed edges
+    // (no two faces traverse the same edge in the same direction).
+    // This is implicit in "manifold + correctly oriented" but easy
+    // to violate on raw triangle soup. The map insert below uses
+    // `try_emplace`; collisions track in `hm.directed_edge_collisions`
+    // so a future caller can detect and reject the input rather than
+    // silently use the first-or-last write.
+    hm.directed_edge_collisions = 0;
     for (uint32_t i = 0; i < nfaces; ++i) {
         const auto& f = mesh.faces[i];
         const uint32_t v0 = f[0], v1 = f[1], v2 = f[2];
@@ -23,9 +31,12 @@ HalfEdgeMesh HalfEdgeMesh::build(const Mesh& mesh) {
         hm.half_edges[he1] = {v1, v2, i, -1, he2, he0};
         hm.half_edges[he2] = {v2, v0, i, -1, he0, he1};
 
-        hm.edge_map[edge_key(v0, v1)] = he0;
-        hm.edge_map[edge_key(v1, v2)] = he1;
-        hm.edge_map[edge_key(v2, v0)] = he2;
+        for (const auto kv : {std::pair<uint64_t,uint32_t>{edge_key(v0, v1), he0},
+                              {edge_key(v1, v2), he1},
+                              {edge_key(v2, v0), he2}}) {
+            auto inserted = hm.edge_map.try_emplace(kv.first, kv.second);
+            if (!inserted.second) ++hm.directed_edge_collisions;
+        }
 
         hm.face_start[i] = he0;
     }

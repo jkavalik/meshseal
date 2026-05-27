@@ -27,7 +27,16 @@ struct HalfEdgeMesh {
     // For each face: the index of its first half-edge (the one from face[0]→face[1])
     std::vector<uint32_t> face_start;
 
+    // Count of directed-edge collisions encountered while building edge_map.
+    // Nonzero indicates the input violates the "no duplicate directed edges"
+    // precondition: the map keeps the FIRST writer (try_emplace) and
+    // subsequent same-direction faces become unreachable via edge_map. A
+    // caller should reject inputs where this is > 0.
+    uint32_t directed_edge_collisions = 0;
+
     // Build from mesh. Requires no degenerate or duplicate faces.
+    // The returned `directed_edge_collisions` counter is nonzero when this
+    // precondition is violated.
     static HalfEdgeMesh build(const Mesh& mesh);
 
     // Encode a directed edge as a uint64_t key

@@ -329,16 +329,30 @@ void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
 // LOCAL to this mesh block; the caller is responsible for any concatenation.
 static Mesh parse_3mf_mesh_block(const std::string& xml,
                                  size_t begin, size_t end) {
-    const size_t verts_open  = xml.find("<vertices>",  begin);
-    const size_t verts_close = xml.find("</vertices>", begin);
-    const size_t tris_open   = xml.find("<triangles>",  begin);
-    const size_t tris_close  = xml.find("</triangles>", begin);
-    if (verts_open  == std::string::npos || verts_open  > end ||
-        verts_close == std::string::npos || verts_close > end ||
-        tris_open   == std::string::npos || tris_open   > end ||
-        tris_close  == std::string::npos || tris_close  > end) {
+    // Defensive: only search within [begin, end). The previous implementation
+    // searched the full xml string with a post-hoc `> end` reject; on
+    // misordered or back-to-back multi-object inputs that pattern could
+    // (in principle) match a sibling object's tags. Constraining the
+    // upper bound up front eliminates the cross-object aliasing risk.
+    if (end > xml.size()) end = xml.size();
+    if (begin > end) begin = end;
+    const size_t span = end - begin;
+    auto find_bounded = [&](const char* needle) -> size_t {
+        const size_t p = xml.find(needle, begin);
+        if (p == std::string::npos || p >= end) return std::string::npos;
+        return p;
+    };
+    const size_t verts_open  = find_bounded("<vertices>");
+    const size_t verts_close = find_bounded("</vertices>");
+    const size_t tris_open   = find_bounded("<triangles>");
+    const size_t tris_close  = find_bounded("</triangles>");
+    if (verts_open  == std::string::npos ||
+        verts_close == std::string::npos ||
+        tris_open   == std::string::npos ||
+        tris_close  == std::string::npos) {
         throw ThreeMfError("missing <vertices>/<triangles> in 3MF <mesh> block");
     }
+    (void)span;
 
     // Caps on count to bound parser work and downstream allocations even
     // when the model XML is within the 256 MB zip-bomb extraction cap.
