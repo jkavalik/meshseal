@@ -72,11 +72,27 @@ Mesh float32_weld(const Mesh& in) {
     return out;
 }
 
+// Internal sentinel thrown from prof_lap when opts.on_progress returns
+// false. Caught by the outer try/catch in repair(); converted to
+// partial_failure=true + a "canceled" note. Distinct exception type so
+// the stage-level try/catch blocks (e.g. intersections.cpp) that swallow
+// std::exception leave this one alone.
+class RepairCanceledException : public std::exception {
+public:
+    const char* what() const noexcept override { return "repair canceled by progress callback"; }
+};
+
 } // anonymous namespace
 
 RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     RepairResult result;
     result.mesh = mesh;
+
+    // Outer try/catch: a RepairCanceledException from prof_lap unwinds
+    // through every recursive sub-repair() frame all the way up here.
+    // Whatever state `result` is in at that point is returned as a
+    // partial result.
+    try {
 
     // --- Input sanity validation ---
     // Reject corrupt input fast instead of grinding on impossible geometry.
@@ -177,17 +193,32 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     };
     dump("input", result.mesh);
 
-    // --- profiling: env MESHSEAL_PROFILE → per-stage stderr wall-clock ---
+    // --- profiling: env MESHSEAL_PROFILE → per-stage stderr wall-clock,
+    //     and progress callback if opts.on_progress is set ---
     const bool prof_env = std::getenv("MESHSEAL_PROFILE") != nullptr;
     auto prof_t0 = std::chrono::steady_clock::now();
     auto prof_last = prof_t0;
     auto prof_lap = [&](const char* label) {
-        if (!prof_env) return;
-        auto now = std::chrono::steady_clock::now();
-        double since_last = std::chrono::duration<double>(now - prof_last).count();
-        double total = std::chrono::duration<double>(now - prof_t0).count();
-        std::fprintf(stderr, "[prof] %-26s %8.2fs  (total %8.2fs)\n",
-                     label, since_last, total);
+        const auto now = std::chrono::steady_clock::now();
+        if (prof_env) {
+            const double since_last = std::chrono::duration<double>(now - prof_last).count();
+            const double total      = std::chrono::duration<double>(now - prof_t0).count();
+            std::fprintf(stderr, "[prof] %-26s %8.2fs  (total %8.2fs)\n",
+                         label, since_last, total);
+        }
+        if (opts.on_progress) {
+            ProgressEvent ev;
+            ev.stage_name      = label;
+            ev.elapsed_ms      = std::chrono::duration<double, std::milli>(now - prof_t0).count();
+            ev.face_count      = static_cast<uint32_t>(result.mesh.faces.size());
+            ev.vertex_count    = static_cast<uint32_t>(result.mesh.vertices.size());
+            ev.recursion_depth = opts.recursion_depth;
+            if (!opts.on_progress(ev)) {
+                // Cancel requested. Throw a sentinel that the outer
+                // try/catch in repair() converts to partial_failure.
+                throw RepairCanceledException();
+            }
+        }
         prof_last = now;
     };
 
@@ -3003,7 +3034,27 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
         result.events.push_back(std::move(ev));
     }
 
+    // Fire one final progress event so the caller sees the run end.
+    if (opts.on_progress) {
+        ProgressEvent ev;
+        ev.stage_name      = "done";
+        ev.elapsed_ms      = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - prof_t0).count();
+        ev.face_count      = static_cast<uint32_t>(result.mesh.faces.size());
+        ev.vertex_count    = static_cast<uint32_t>(result.mesh.vertices.size());
+        ev.recursion_depth = opts.recursion_depth;
+        opts.on_progress(ev);  // return value ignored — we're done
+    }
+
     return result;
+    } catch (const RepairCanceledException&) {
+        // User cancelled mid-pipeline. Return whatever state result is
+        // in at this point — the caller can decide whether to discard
+        // result.mesh or use it (e.g. show a "partial result" preview).
+        result.partial_failure = true;
+        result.notes.push_back("repair canceled by progress callback");
+        return result;
+    }
 }
 
 } // namespace meshseal

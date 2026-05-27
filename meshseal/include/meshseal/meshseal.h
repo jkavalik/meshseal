@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -76,6 +77,32 @@ struct RepairResult {
     double confidence = 0.0;
 };
 
+// One snapshot of pipeline progress, passed to RepairOptions::on_progress
+// at every stage boundary. The callback can ignore most fields and just
+// display `stage_name`, or use the elapsed/face-count fields to drive a
+// progress bar. Return `false` from the callback to request cancellation;
+// repair() will set partial_failure=true and return at the next stage.
+struct ProgressEvent {
+    // Name of the next stage about to start (e.g. "weld", "nm_edge",
+    // "collapse_nm"). The last event of the run is named "done".
+    std::string stage_name;
+
+    // Wall-clock milliseconds since the OUTERMOST repair() entry. Stays
+    // monotonic across recursive sub-repairs (nm_carve_refill,
+    // spatial_split per-cluster fan-out).
+    double      elapsed_ms     = 0.0;
+
+    // Snapshot of the in-progress mesh at the moment the event fires.
+    uint32_t    face_count     = 0;
+    uint32_t    vertex_count   = 0;
+
+    // Depth in the recursive repair() call tree. 0 = outermost call.
+    // nm_carve_refill, spatial_split, and coplanar_fan_drop all recurse
+    // and bump this. Useful for UIs that want to indent / flatten the
+    // event stream.
+    int         recursion_depth = 0;
+};
+
 struct RepairOptions {
     bool weld            = true;
     bool degenerate      = true;
@@ -121,6 +148,19 @@ struct RepairOptions {
     // the corpus) fall through to the existing path at near-zero cost.
     // Not for user code to set.
     bool allow_spatial_split  = true;
+
+    // Optional progress callback. Called at every stage boundary inside
+    // repair() with a ProgressEvent describing what the pipeline is
+    // about to do. Return `true` to continue; `false` to request
+    // cancellation (repair() bails at the next stage boundary with
+    // partial_failure=true + a "canceled by callback" note).
+    //
+    // The default (empty std::function) disables the callback entirely
+    // with zero overhead on the hot path. Thread-safety: today the
+    // library is single-threaded, so the callback fires on the caller's
+    // thread and needs no synchronisation. If meshseal ever parallelises
+    // internally, this contract will be revisited.
+    std::function<bool(const ProgressEvent&)> on_progress;
 };
 
 RepairResult repair(const Mesh& mesh, const RepairOptions& opts = RepairOptions{});
