@@ -27,6 +27,7 @@
 #include "stages/strip_doubled_membrane.h"
 #include "stl_io.h"
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>

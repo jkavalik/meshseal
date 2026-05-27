@@ -31,9 +31,12 @@ HalfEdgeMesh HalfEdgeMesh::build(const Mesh& mesh) {
         hm.half_edges[he1] = {v1, v2, i, -1, he2, he0};
         hm.half_edges[he2] = {v2, v0, i, -1, he0, he1};
 
-        for (const auto kv : {std::pair<uint64_t,uint32_t>{edge_key(v0, v1), he0},
-                              {edge_key(v1, v2), he1},
-                              {edge_key(v2, v0), he2}}) {
+        const std::pair<uint64_t, uint32_t> kvs[3] = {
+            {edge_key(v0, v1), he0},
+            {edge_key(v1, v2), he1},
+            {edge_key(v2, v0), he2},
+        };
+        for (const auto& kv : kvs) {
             auto inserted = hm.edge_map.try_emplace(kv.first, kv.second);
             if (!inserted.second) ++hm.directed_edge_collisions;
         }

@@ -46,3 +46,4 @@ build_output.txt
 Thumbs.db
 desktop.ini
 .DS_Store
+/build-wsl
