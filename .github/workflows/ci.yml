@@ -1,0 +1,63 @@
+name: ci
+
+# Build + test on the three supported platforms. Catches MSVC / libstdc++ /
+# libc++ / Apple-Clang differences that local Windows-only dev cannot see.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cache the FetchContent deps (Catch2 + manifold + miniz). Without this
+      # each run rebuilds them from source (~30-60 s). Key on the CMakeLists
+      # so any dep-version bump invalidates.
+      - name: Cache _deps
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # ctest discovers the Catch2 test cases (via catch_discover_tests in
+      # tests/CMakeLists.txt). --output-on-failure prints details only when
+      # a case fails. -C selects the multi-config (Windows VS) configuration.
+      - name: Test
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+      # On failure, upload the CLI + test binaries + CMakeFiles logs so we
+      # can debug without re-running CI locally.
+      - name: Upload build artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            build/cli/**/meshseal_cli*
+            build/tests/**/tests_meshseal*
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+          retention-days: 7
