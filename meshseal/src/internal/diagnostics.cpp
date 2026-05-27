@@ -71,7 +71,7 @@ MeshDiagnostics compute_diagnostics(const meshseal::Mesh& mesh) {
     }
 
     // --- Signed volume ---
-    const Vec3d origin = {0.0, 0.0, 0.0};
+    // (signed_tet_volume implicitly uses the origin as the apex)
     for (const auto& f : faces) {
         const Vec3d a = verts[f[0]];
         const Vec3d b = verts[f[1]];

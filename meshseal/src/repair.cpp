@@ -541,7 +541,7 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                     opts.recursion_depth < 2 &&
                     !result.mesh.faces.empty()) {
                     auto post_merge = cached_diag(result.mesh);
-                    constexpr uint32_t kCarveMaxNm = 20u;
+                    constexpr int kCarveMaxNm = 20;
                     if (post_merge.non_manifold_edges > 0 &&
                         post_merge.non_manifold_edges <= kCarveMaxNm) {
                         auto cr = stages::nm_carve_refill(result.mesh, /*halo_rings=*/1);
@@ -762,7 +762,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
     // the "big cube with corner missing + internal hole" output observed
     // on soup_seed0011 et al). Pile-reintegration skips synthetic entries.
     std::vector<bool> pile_synthetic;
-    bool any_manifold_ran = false;
     bool fwn_used         = false;  // see Phase 9R intersections gate
 
     // --- Phase 6R: aggregate ALL SOUP components into one bag, then run
@@ -875,7 +874,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                         std::to_string(sr.faces_after) + " manifold faces");
                     closed_queue.push_back(std::move(sr.mesh));
                     closed_queue_preserve.push_back(false);  // soup-aggregation output, no user-original
-                    any_manifold_ran = true;
                     sr_kept = true;
                 } else if (!sr.was_needed) {
                     // Pre-processing (weld + orient) made it manifold without CSG.
@@ -979,7 +977,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                                 internal::extract_component(fr.mesh, sub.face_indices));
                             closed_queue_preserve.push_back(false);  // FWN synthetic output
                         }
-                        any_manifold_ran = true;
                     } else {
                         result.notes.push_back("soup_reconstruct + voxel_levelset both failed on aggregated soup (" +
                             std::to_string(soup_face_total) + " faces, preserved in pile)");
@@ -1116,7 +1113,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 auto d2 = cached_diag(r);
                 if (d2.non_manifold_edges == 0 && d2.open_boundary_edges == 0) {
                     manifold_closed_queue.push_back(std::move(r));
-                    any_manifold_ran = true;
                     ok = true;
                 }
             } else if (guard_active && sr.was_needed && sr.success && sr.mesh.faces.size() < min_keep) {
@@ -1245,7 +1241,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                         if (ir.had_intersections)
                             result.notes.push_back("intersections: manifold self-union resolved intersections (" +
                                 std::to_string(ir.faces_before) + " -> " + std::to_string(ir.faces_after) + " faces)");
-                        any_manifold_ran = true;
                     } else {
                         result.notes.push_back("intersections: result had more nm edges, skipped");
                     }
@@ -1375,7 +1370,6 @@ RepairResult repair(const Mesh& mesh, const RepairOptions& opts) {
                 std::to_string(pile.size()) + " unrepairable components (" +
                 std::to_string(pile_bag.faces.size()) + " -> " +
                 std::to_string(sr.mesh.faces.size()) + " faces)");
-            any_manifold_ran = true;
             pile.clear();  // consumed; don't raw-append below
         }
     }

@@ -15,6 +15,12 @@
 
 namespace meshseal {
 
+// miniz declares MZ_DEFAULT_COMPRESSION etc. in an anonymous enum (signed),
+// but its API expects mz_uint (unsigned). Cast once into a typed constant
+// so the call sites don't trip MSVC's C4245 signed/unsigned-mismatch warning.
+static constexpr mz_uint kMzDefaultCompression =
+    static_cast<mz_uint>(MZ_DEFAULT_COMPRESSION);
+
 // ---------------------------------------------------------------------------
 // Locale-independent numeric parsers.
 //
@@ -150,7 +156,7 @@ void write_3mf(const Mesh& mesh, const std::filesystem::path& path) {
 
     ok = ok && mz_zip_writer_add_mem(&zip, "[Content_Types].xml",
         k_content_types, std::strlen(k_content_types),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     static const char* k_rels =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -161,11 +167,11 @@ void write_3mf(const Mesh& mesh, const std::filesystem::path& path) {
 
     ok = ok && mz_zip_writer_add_mem(&zip, "_rels/.rels",
         k_rels, std::strlen(k_rels),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     ok = ok && mz_zip_writer_add_mem(&zip, "3D/3dmodel.model",
         model.data(), model.size(),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     ok = ok && mz_zip_writer_finalize_archive(&zip);
     mz_zip_writer_end(&zip);
@@ -294,7 +300,7 @@ void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
 
     ok = ok && mz_zip_writer_add_mem(&zip, "[Content_Types].xml",
         k_content_types, std::strlen(k_content_types),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     static const char* k_rels =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -305,16 +311,16 @@ void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
 
     ok = ok && mz_zip_writer_add_mem(&zip, "_rels/.rels",
         k_rels, std::strlen(k_rels),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     ok = ok && mz_zip_writer_add_mem(&zip, "3D/3dmodel.model",
         model.data(), model.size(),
-        MZ_DEFAULT_COMPRESSION);
+        kMzDefaultCompression);
 
     if (write_slic3r_config && !slic3r_cfg.empty()) {
         ok = ok && mz_zip_writer_add_mem(&zip, "Metadata/Slic3r_PE_model.config",
             slic3r_cfg.data(), slic3r_cfg.size(),
-            MZ_DEFAULT_COMPRESSION);
+            kMzDefaultCompression);
     }
 
     ok = ok && mz_zip_writer_finalize_archive(&zip);

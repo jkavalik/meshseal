@@ -56,3 +56,12 @@ target_compile_options(meshseal PRIVATE
     $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>>:-Wall>
     $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>>:-Wextra>
 )
+
+# MSVC marks std::getenv (and other POSIX C-stdlib functions) as deprecated
+# in favor of its proprietary _dupenv_s/_s variants. Both repair.cpp and
+# any future code that reads env vars (MESHSEAL_PROFILE, MESHSEAL_DUMP_DIR)
+# hit this. Suppressing the deprecation warning is the standard
+# cross-platform approach — using std::getenv is correct C++.
+target_compile_definitions(meshseal PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>
+)
