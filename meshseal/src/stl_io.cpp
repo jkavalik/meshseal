@@ -15,24 +15,38 @@ namespace meshseal {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-static float read_f32_le(const uint8_t* p) {
-    float v;
-    std::memcpy(&v, p, 4);
-    return v;
-}
+// The binary STL format is defined as little-endian (4-byte floats + uint32
+// counts). The implementations below are explicit byte-order — works on big-
+// endian hosts as well as little-endian. Modern compilers (GCC, Clang, MSVC)
+// recognize the byte-OR / byte-store patterns and emit a single load/store
+// plus a conditional bswap, so there is no perf cost on x86/ARM (LE) and the
+// code stays correct on the rare BE host (POWER BE, MIPS BE).
 
 static uint32_t read_u32_le(const uint8_t* p) {
-    uint32_t v;
-    std::memcpy(&v, p, 4);
+    return  static_cast<uint32_t>(p[0])
+         | (static_cast<uint32_t>(p[1]) <<  8)
+         | (static_cast<uint32_t>(p[2]) << 16)
+         | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static void write_u32_le(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>( v        & 0xffu);
+    p[1] = static_cast<uint8_t>((v >>  8) & 0xffu);
+    p[2] = static_cast<uint8_t>((v >> 16) & 0xffu);
+    p[3] = static_cast<uint8_t>((v >> 24) & 0xffu);
+}
+
+static float read_f32_le(const uint8_t* p) {
+    const uint32_t u = read_u32_le(p);
+    float v;
+    std::memcpy(&v, &u, sizeof(v));  // type-pun without UB
     return v;
 }
 
 static void write_f32_le(uint8_t* p, float v) {
-    std::memcpy(p, &v, 4);
-}
-
-static void write_u32_le(uint8_t* p, uint32_t v) {
-    std::memcpy(p, &v, 4);
+    uint32_t u;
+    std::memcpy(&u, &v, sizeof(u));
+    write_u32_le(p, u);
 }
 
 // ---------------------------------------------------------------------------
