@@ -1,4 +1,10 @@
-add_library(meshseal STATIC
+if(MESHSEAL_BUILD_SHARED)
+    set(_meshseal_lib_type SHARED)
+else()
+    set(_meshseal_lib_type STATIC)
+endif()
+
+add_library(meshseal ${_meshseal_lib_type}
     src/repair.cpp
     src/pipeline.cpp
     src/mesh.cpp

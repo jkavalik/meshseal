@@ -5,13 +5,32 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Build the FetchContent deps statically so the CLI / test binaries have
-# no runtime DLL dependencies. Without this:
+# MESHSEAL_BUILD_SHARED — when ON, build the meshseal library itself
+# as SHARED so its bundled deps (manifold, miniz, fast_float) stay
+# internal and don't conflict with the host project's own copies of
+# those libraries. Default OFF preserves the standalone CLI behavior.
+# Set ON when embedding meshseal into another CMake project that has
+# its own miniz / manifold / etc. (e.g. PrusaSlicer integration).
+option(MESHSEAL_BUILD_SHARED
+    "Build meshseal as a shared library with bundled deps internalised"
+    OFF)
+
+# When meshseal itself is built as SHARED, every static dep linked into
+# it needs to be position-independent (Linux ELF doesn't allow non-PIC
+# relocations in shared libraries). Set the global default BEFORE
+# FetchContent_MakeAvailable so the fetched deps inherit it.
+if(MESHSEAL_BUILD_SHARED)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Build the FetchContent deps statically so the CLI / test binaries
+# have no runtime DLL dependencies. Without this:
 #   - Windows: catch_discover_tests fails with 0xc0000135 because
 #     tests_meshseal.exe can't find manifold.dll / miniz.dll at build time.
 #   - Linux/macOS: standalone meshseal_cli requires libmanifold.so / .dylib
 #     on LD_LIBRARY_PATH / DYLD_LIBRARY_PATH at runtime.
-# Static deps make every binary self-contained.
+# Static deps make every binary self-contained. Independent of whether
+# meshseal itself is built as STATIC or SHARED (see MESHSEAL_BUILD_SHARED).
 set(BUILD_SHARED_LIBS OFF)
 
 # miniz 3.0.2 declares cmake_minimum_required(VERSION 3.0) at the top of
