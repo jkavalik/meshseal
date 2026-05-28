@@ -15,6 +15,11 @@ option(MESHSEAL_BUILD_SHARED
     "Build meshseal as a shared library with bundled deps internalised"
     OFF)
 
+# Skip building the CLI / tests when meshseal is consumed as a sub-project.
+# A host project just wants the library target.
+option(MESHSEAL_BUILD_CLI   "Build the meshseal_cli executable"   ON)
+option(MESHSEAL_BUILD_TESTS "Build the tests_meshseal executable" ON)
+
 # When meshseal itself is built as SHARED, every static dep linked into
 # it needs to be position-independent (Linux ELF doesn't allow non-PIC
 # relocations in shared libraries). Set the global default BEFORE
@@ -94,8 +99,28 @@ set(MANIFOLD_EXPORT           OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(MANIFOLD_BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(Catch2 manifold miniz fast_float)
+# Only fetch deps the host project hasn't already provided as targets.
+# When meshseal is embedded into a larger CMake project (PrusaSlicer
+# being the motivating example) the host typically defines its own
+# `miniz` target; skipping ours avoids `add_library` collisions. Same
+# for manifold / fast_float / Catch2 if a host ever provides them.
+set(_meshseal_to_fetch)
+foreach(_dep manifold miniz fast_float)
+    if(NOT TARGET ${_dep})
+        list(APPEND _meshseal_to_fetch ${_dep})
+    endif()
+endforeach()
+if(MESHSEAL_BUILD_TESTS AND NOT TARGET Catch2::Catch2WithMain)
+    list(APPEND _meshseal_to_fetch Catch2)
+endif()
+if(_meshseal_to_fetch)
+    FetchContent_MakeAvailable(${_meshseal_to_fetch})
+endif()
 
 add_subdirectory(meshseal)
-add_subdirectory(cli)
-add_subdirectory(tests)
+if(MESHSEAL_BUILD_CLI)
+    add_subdirectory(cli)
+endif()
+if(MESHSEAL_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
