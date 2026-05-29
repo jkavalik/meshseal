@@ -220,7 +220,6 @@ BridgeLoopsResult bridge_paired_loops(const Mesh& mesh,
         Vec3     centroid;
         double   radius;
         uint32_t comp;
-        Vec3     normal;       // loop normal, in the loop's natural traversal order
     };
     std::vector<LoopInfo> infos;
     for (auto& loop : loops) {
@@ -238,28 +237,8 @@ BridgeLoopsResult bridge_paired_loops(const Mesh& mesh,
             double r = dist(mesh.vertices[vi], c);
             if (r > max_r) max_r = r;
         }
-        // Loop normal (oriented per loop's natural traversal order, which
-        // matches the incident shell's winding at the boundary). Computed
-        // as Σ (p[i]-c) × (p[i+1]-c) — same convention as Newell's normal
-        // for polygons. Used downstream to reject zipping two oppositely-
-        // wound shells (vortex.stl bug: bridge zipped two shells whose
-        // shell-winding was inverted relative to each other, producing a
-        // topologically closed but volumetrically-zero output).
-        Vec3 ln{0,0,0};
-        const size_t nl = loop.size();
-        for (size_t li = 0; li < nl; ++li) {
-            const auto& p0 = mesh.vertices[loop[li]];
-            const auto& p1 = mesh.vertices[loop[(li+1)%nl]];
-            Vec3 a{ p0[0]-c[0], p0[1]-c[1], p0[2]-c[2] };
-            Vec3 b{ p1[0]-c[0], p1[1]-c[1], p1[2]-c[2] };
-            ln[0] += a[1]*b[2] - a[2]*b[1];
-            ln[1] += a[2]*b[0] - a[0]*b[2];
-            ln[2] += a[0]*b[1] - a[1]*b[0];
-        }
-        const double ll = std::sqrt(ln[0]*ln[0] + ln[1]*ln[1] + ln[2]*ln[2]);
-        if (ll > 1e-30) { ln[0] /= ll; ln[1] /= ll; ln[2] /= ll; }
         uint32_t comp = dsu.find(loop[0]);
-        infos.push_back({std::move(loop), c, max_r, comp, ln});
+        infos.push_back({std::move(loop), c, max_r, comp});
     }
     if (infos.size() < 2) return result;
 
@@ -287,12 +266,35 @@ BridgeLoopsResult bridge_paired_loops(const Mesh& mesh,
     auto base_diag = internal::compute_diagnostics(result.mesh);
     int  cur_nm  = static_cast<int>(base_diag.non_manifold_edges);
     int  cur_bnd = static_cast<int>(base_diag.open_boundary_edges);
+    // NOTE on removed pre-guards (2026-05-29): two extra pre-bridge gates
+    // — a coincident-loop guard (reject d/avg_r < 0.1) and a winding-
+    // compatibility guard (reject loop-normal dot > -0.3) — were added on
+    // 2026-05-25 to stop vortex.stl zipping two coincident opposite-wound
+    // shells into a deceptively-clean vol-0 output. They have been REMOVED.
+    //   1. They were geometrically indistinguishable from a genuine shared
+    //      opening: captain_toad's mouth is exactly a coincident
+    //      (d/avg_r ≈ 0.02) pair with PARALLEL loop normals — so both
+    //      guards rejected it, the per-component hole-fill then capped the
+    //      mouth, and captain_toad regressed to a visually-closed mouth
+    //      (still topologically CLEAN, so the sweep never caught it).
+    //   2. The vortex.stl pathology they targeted no longer occurs: later
+    //      pipeline evolution (the manifold self-union in `intersections`
+    //      plus the volume/containment filtering in `shells`) now resolves
+    //      vortex to a clean non-degenerate solid on its own. Verified:
+    //      vortex/vortex2/vortex3 stay clean (vol ≫ 0) without the guards.
+    // Removal verified across the 148-fixture corpus (identical 8-fixture
+    // floor with and without the guards) and the 49-file real-world c3d
+    // batch (48 CLEAN, 1 inherent fail, no regression), while captain_toad's
+    // mouth is bridged open again (vol 9130, the expected open-mouth value).
+    // The downstream per-strip rollback guard below (bnd must drop, nm must
+    // not rise) remains and is what rejects genuine mis-pairs.
     for (const auto& pe : pairs) {
         int i = pe.i, j = pe.j;
         if (bridged[i] || bridged[j]) continue;
         double avg_r = (infos[i].radius + infos[j].radius) * 0.5;
         if (avg_r < 1e-9 || pe.d >= max_dist_factor * avg_r) continue;
-        // Genuinely-coincident gate: similar radius and similar vertex count.
+        // Similar radius and similar vertex count (a genuine shared opening
+        // pairs two rims of comparable size).
         double ri = infos[i].radius, rj = infos[j].radius;
         double r_ratio = std::min(ri, rj) / std::max(ri, rj);
         if (r_ratio < min_radius_ratio) continue;
@@ -301,35 +303,6 @@ BridgeLoopsResult bridge_paired_loops(const Mesh& mesh,
         double v_ratio = std::min(ni, nj) / std::max(ni, nj);
         if (v_ratio < min_vert_ratio) continue;
         if (segment_blocked(mesh, infos[i].centroid, infos[j].centroid)) continue;
-
-        // Winding-compatibility gate: two compatible loops bridging a gap
-        // between facing shells have *anti-parallel* natural-traversal
-        // normals (one shell's boundary winds CCW as viewed from the gap,
-        // the other CW). If the two loop normals are parallel (same
-        // direction), the candidate shells are wound oppositely relative
-        // to each other — zipping them creates a topologically closed but
-        // volumetrically-zero surface (vortex.stl: vol 2283 → vol 0 with
-        // bnd=0 nm=0, a deceptively-clean-looking output that integrates
-        // to zero). Require dot(n_i, n_j) < -0.3 to accept (negative ⇒
-        // anti-parallel ⇒ compatible). Threshold loose to allow non-
-        // planar loops where centroids' projected normals still align.
-        // Coincident-loop guard: two loops with centroid distance much
-        // smaller than their radius (d/avg_r ≪ 1) are TWO COPIES OF THE
-        // SAME LOOP, not partners facing each other across a gap.
-        // Bridging them sums +V (one shell) and -V (its inside-out copy)
-        // to zero volume, producing a topologically-watertight but
-        // geometrically-degenerate result (vortex.stl: vol 2283 -> 0,
-        // observed d/avg_r = 0.05). Genuine bridges sit on a real gap
-        // and have d/avg_r in (0.1, max_dist_factor]. Floor at 0.1.
-        if (pe.d < 0.1 * avg_r) continue;
-        // Winding-compatibility check (defense in depth — coincident
-        // copies often pair anti-parallel too, but a same-winding pair
-        // CAN slip through if the user's bbox is asymmetric and the
-        // loop is not perfectly closed).
-        const Vec3& ni_n = infos[i].normal;
-        const Vec3& nj_n = infos[j].normal;
-        const double n_dot = ni_n[0]*nj_n[0] + ni_n[1]*nj_n[1] + ni_n[2]*nj_n[2];
-        if (n_dot > -0.3) continue;
 
         auto bf = bridge_two_loops(verts, infos[i].loop, infos[j].loop);
         if (bf.empty()) continue;

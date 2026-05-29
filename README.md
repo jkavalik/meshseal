@@ -3,10 +3,21 @@
 A C++17 mesh repair library and CLI for 3D printing. Reads STL or 3MF,
 outputs a watertight 2-manifold solid suitable for slicing.
 
-> **Status: 0.1.0 — alpha.** APIs are not stable; the library is being
+> **Status: 0.1.3 — alpha.** APIs are not stable; the library is being
 > developed against a real-world corpus of 148 defective fixtures plus
 > ~1200 anomalous real-world STLs from a developer's print archive.
 > Cross-platform CI on Windows, Linux, and macOS.
+
+> **How this was built.** meshseal is "vibe coded" — the C++ was
+> authored by an AI agent from natural-language direction, with a human
+> driving the design decisions, reviewing changes, and validating every
+> step. The trade-off this implies for you as a user: correctness rests
+> on the empirical safety net rather than on hand-audited code — every
+> change is gated by the 670 unit-test assertions, the 148-fixture sweep,
+> and the
+> real-world batch runs described above, and a multi-agent code +
+> security review pass was run over the whole library (see the changelog).
+> Treat it accordingly: well-exercised, but young and AI-authored.
 
 ## What it does
 
@@ -74,7 +85,7 @@ CMake integration via FetchContent:
 include(FetchContent)
 FetchContent_Declare(meshseal
     GIT_REPOSITORY https://github.com/jkavalik/meshseal.git
-    GIT_TAG        v0.1.0)
+    GIT_TAG        v0.1.3)
 FetchContent_MakeAvailable(meshseal)
 
 target_link_libraries(my_app PRIVATE meshseal)
@@ -144,9 +155,9 @@ collapsing them to a unit tetrahedron, which meshseal refuses
 Linux is the documented `unordered_map` iteration-order gap; meshseal
 on Win/Mac scores 141/148.
 
-## What's in v0.1.0
+## What's in it
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the full release notes.
+See [`CHANGELOG.md`](CHANGELOG.md) for the full per-release notes.
 
 Highlights:
 

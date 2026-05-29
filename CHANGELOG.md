@@ -5,6 +5,48 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning is [Semantic Versioning](https://semver.org/) — though the
 **0.x** series makes no API-stability promises.
 
+## 0.1.3 — 2026-05-29
+
+### Fixed
+
+- **Cross-shell openings (e.g. an open mouth / cavity) no longer get
+  sealed shut during repair.** Two over-eager pre-bridge guards in
+  `bridge_loops` (a coincident-loop test and a loop-winding test, added
+  in a prior version to stop a degenerate zip on one pathological input)
+  also rejected legitimate coincident shared-rim loop pairs — so a
+  shared opening between two shells got hole-filled closed. The output
+  stayed topologically watertight, so the test corpus never flagged it;
+  only viewing a repaired model in a renderer revealed the regression.
+  The guards are removed now that later pipeline stages (manifold
+  self-union + shell filtering) independently resolve the degenerate
+  case they were added for. The per-strip rollback guard (a bridge must
+  reduce the open-boundary count and must not add non-manifold edges)
+  remains. No regressions across the 148-fixture corpus, the vortex
+  family, or the ~49-file real-world batch.
+
+## 0.1.2 — 2026-05-28
+
+### Added
+
+- **`MESHSEAL_BUILD_CLI` / `MESHSEAL_BUILD_TESTS` CMake options**
+  (default ON) so a host project consuming meshseal as a sub-project can
+  build just the library target.
+- **Host-target conflict guards.** FetchContent of the bundled deps
+  (manifold, miniz, fast_float) is now wrapped in `if(NOT TARGET <name>)`
+  so meshseal yields to a host project that already provides a same-named
+  target (e.g. PrusaSlicer's bundled miniz) instead of colliding.
+
+Required for embedding meshseal into PrusaSlicer.
+
+## 0.1.1 — 2026-05-27
+
+### Added
+
+- **`MESHSEAL_BUILD_SHARED` CMake option** (default OFF) to build
+  meshseal as a shared library with its bundled deps linked statically
+  inside, for embedding into projects that vendor their own copies of
+  those deps without symbol conflicts. Standalone CLI build unchanged.
+
 ## 0.1.0 — 2026-05-27
 
 First tagged release. Alpha quality; APIs not stable.
