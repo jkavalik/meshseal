@@ -20,6 +20,30 @@ option(MESHSEAL_BUILD_SHARED
 option(MESHSEAL_BUILD_CLI   "Build the meshseal_cli executable"   ON)
 option(MESHSEAL_BUILD_TESTS "Build the tests_meshseal executable" ON)
 
+# MESHSEAL_BUILD_WASM — build the Emscripten/WebAssembly entry shim
+# (wasm/meshseal_wasm.cpp -> meshseal.js + meshseal.wasm). Only meaningful
+# under the Emscripten toolchain; configure with:
+#   emcmake cmake -S . -B build-wasm -DMESHSEAL_BUILD_WASM=ON \
+#                 -DMESHSEAL_BUILD_CLI=OFF -DMESHSEAL_BUILD_TESTS=OFF
+# Default OFF; native builds are completely unaffected.
+option(MESHSEAL_BUILD_WASM  "Build the WebAssembly entry shim"    OFF)
+
+# Under Emscripten the CLI (filesystem paths) and the Catch2 test runner
+# don't apply — force them off and enable C++ exceptions library-wide.
+# The meshseal library itself relies on try/catch internally (the
+# cancellation path, the intersections-stage guard), and manifold throws;
+# Emscripten disables exceptions by default for size, so the whole build
+# (meshseal + manifold + the shim) must opt in or those try/catch blocks
+# silently abort instead of catching. MANIFOLD_PAR=OFF keeps the build
+# single-threaded (no TBB / SharedArrayBuffer).
+if(EMSCRIPTEN)
+    set(MESHSEAL_BUILD_CLI   OFF CACHE BOOL "" FORCE)
+    set(MESHSEAL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MANIFOLD_PAR         OFF CACHE BOOL "" FORCE)
+    add_compile_options(-fexceptions)
+    add_link_options(-fexceptions)
+endif()
+
 # When meshseal itself is built as SHARED, every static dep linked into
 # it needs to be position-independent (Linux ELF doesn't allow non-PIC
 # relocations in shared libraries). Set the global default BEFORE
@@ -123,4 +147,7 @@ if(MESHSEAL_BUILD_CLI)
 endif()
 if(MESHSEAL_BUILD_TESTS)
     add_subdirectory(tests)
+endif()
+if(MESHSEAL_BUILD_WASM)
+    add_subdirectory(wasm)
 endif()

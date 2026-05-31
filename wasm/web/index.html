@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>meshseal — free in-browser mesh repair</title>
+<meta name="description" content="Free, in-browser repair for broken STL & 3MF meshes — watertight & manifold, ready to slice. Runs entirely on your device." />
+<meta name="theme-color" content="#0f1216" />
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" type="image/png" href="favicon-32.png" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c23; --panel2: #1e252e;
+    --fg: #e6edf3; --muted: #9aa7b4; --accent: #4ea1ff; --accent2: #2bd47d;
+    --warn: #f0b429; --err: #ff6b6b; --border: #2a313b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 60px; width: 100%; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .tagline { color: var(--muted); margin: 0 0 18px; }
+  .privacy {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: rgba(43,212,125,0.10); color: var(--accent2);
+    border: 1px solid rgba(43,212,125,0.30); border-radius: 999px;
+    padding: 5px 14px; font-size: 13px; margin-bottom: 24px;
+  }
+  #drop {
+    border: 2px dashed var(--border); border-radius: 14px;
+    background: var(--panel); padding: 44px 20px; text-align: center;
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: var(--accent); background: var(--panel2); }
+  #drop .big { font-size: 17px; }
+  #drop .sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .filerow {
+    display: none; align-items: center; justify-content: space-between;
+    gap: 12px; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 16px; margin-top: 16px;
+  }
+  .filerow .name { font-weight: 600; word-break: break-all; }
+  .filerow .meta { color: var(--muted); font-size: 13px; }
+  button {
+    font: inherit; font-weight: 600; border: 0; border-radius: 9px;
+    padding: 10px 20px; cursor: pointer; color: #06223f; background: var(--accent);
+  }
+  button.secondary { background: var(--panel2); color: var(--fg); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.go { background: var(--accent2); color: #053019; }
+  .warn { color: var(--warn); font-size: 13px; margin-top: 10px; display: none; }
+  #progressWrap { display: none; margin-top: 22px; }
+  .bar { height: 10px; background: var(--panel2); border-radius: 999px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg,var(--accent),var(--accent2)); transition: width .2s; }
+  .stage { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .progress-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
+  #cancelBtn { padding: 5px 14px; font-size: 13px; }
+  #result { display: none; margin-top: 24px; }
+  .verdict { font-size: 18px; font-weight: 700; margin-bottom: 12px; }
+  .verdict.ok { color: var(--accent2); }
+  .verdict.partial { color: var(--warn); }
+  .verdict.bad { color: var(--err); }
+  .caveat { color: var(--warn); font-size: 13px; margin: -6px 0 14px; line-height: 1.45; }
+  .caveat.hidden { display: none; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  td, th { padding: 9px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 14px; }
+  th { color: var(--muted); font-weight: 600; width: 45%; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .notes { color: var(--muted); font-size: 12.5px; margin-top: 18px; white-space: pre-wrap;
+           max-height: 220px; overflow-y: auto; background: var(--panel);
+           border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .notes:empty { display: none; }
+  .notes-label { color: var(--muted); font-size: 12px; text-transform: uppercase;
+                 letter-spacing: .06em; margin-top: 20px; }
+  .notes-label.hidden { display: none; }
+  #error { display: none; margin-top: 22px; color: var(--err); background: rgba(255,107,107,0.08);
+           border: 1px solid rgba(255,107,107,0.3); border-radius: 10px; padding: 14px 16px; }
+  .actions { display: flex; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+  footer { margin-top: auto; color: var(--muted); font-size: 12.5px; text-align: center;
+           padding: 22px 20px; border-top: 1px solid var(--border); }
+  a { color: var(--accent); }
+  .hidden { display: none !important; }
+  #previewWrap { margin: 18px 0 4px; }
+  .preview-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .seg-group { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg { background: var(--panel2); color: var(--muted); border: 0; padding: 6px 18px; font-size: 13px; cursor: pointer; border-radius: 0; }
+  .seg.active { background: var(--accent); color: #06223f; }
+  .seg:disabled { opacity: .4; cursor: default; }
+  .preview-hint { color: var(--muted); font-size: 12px; }
+  .legend-red { color: var(--err); font-weight: 600; }
+  .legend-cyan { color: #19e3ff; font-weight: 600; }
+  #viewer { height: 340px; border-radius: 10px; overflow: hidden; background: #0f1216; border: 1px solid var(--border); touch-action: none; }
+  #viewer canvas { display: block; width: 100%; height: 100%; }
+  .preview-note { color: var(--muted); font-size: 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .topbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+  .topbar .privacy { margin-bottom: 0; }
+  #install { padding: 6px 14px; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>meshseal</h1>
+  <p class="tagline">Free, in-browser repair for broken STL &amp; 3MF meshes — watertight &amp; manifold, ready to slice.</p>
+  <div class="topbar">
+    <div class="privacy">🔒 Your model never leaves your device — repair runs entirely in your browser.</div>
+    <button class="secondary hidden" id="install">⬇ Install app</button>
+  </div>
+
+  <div id="drop">
+    <div class="big">Drop an STL or 3MF file here</div>
+    <div class="sub">or click to choose — STL (binary/ASCII) or 3MF (multi-volume preserved)</div>
+    <input id="file" type="file" accept=".stl,.3mf,model/stl,model/3mf" hidden />
+  </div>
+
+  <div class="filerow" id="filerow">
+    <div>
+      <div class="name" id="fname">—</div>
+      <div class="meta" id="fmeta"></div>
+    </div>
+    <button class="go" id="repair">Repair</button>
+  </div>
+  <div class="warn" id="bigwarn"></div>
+
+  <div id="previewWrap" class="hidden">
+    <div class="preview-bar" id="previewBar">
+      <div class="seg-group">
+        <button id="btnBefore" class="seg active" type="button">Before</button>
+        <button id="btnAfter" class="seg" type="button" disabled>After</button>
+      </div>
+      <span class="preview-hint">drag to rotate · scroll to zoom · <span class="legend-red">red</span> = holes / flipped normals · <span class="legend-cyan">cyan</span> = open edges</span>
+    </div>
+    <div id="viewer"></div>
+    <div id="previewNote" class="preview-note hidden"></div>
+  </div>
+
+  <div id="progressWrap">
+    <div class="bar"><div id="barfill"></div></div>
+    <div class="progress-row">
+      <div class="stage" id="stagetext">Loading engine…</div>
+      <button class="secondary" id="cancelBtn" type="button">Cancel</button>
+    </div>
+  </div>
+
+  <div id="result">
+    <div class="verdict" id="verdict"></div>
+    <div class="caveat hidden" id="caveat"></div>
+    <table id="stats"></table>
+    <div class="actions">
+      <button id="download">Download repaired STL</button>
+      <button class="secondary" id="again">Repair another</button>
+    </div>
+    <div class="notes-label" id="noteslabel">Repair log</div>
+    <div class="notes" id="notes"></div>
+  </div>
+
+  <div id="error"></div>
+</main>
+
+<footer>
+  Runs 100% client-side via WebAssembly — no upload, no account, nothing stored.
+  Very large meshes may exceed browser memory; for those, use the
+  <a href="https://github.com/jkavalik/meshseal" target="_blank" rel="noopener">command-line tool</a>.
+</footer>
+
+<script src="app.js"></script>
+<script type="module" src="viewer.js"></script>
+</body>
+</html>

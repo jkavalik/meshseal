@@ -1,0 +1,16 @@
+{
+  "name": "meshseal — mesh repair",
+  "short_name": "meshseal",
+  "description": "Free, in-browser repair for broken STL & 3MF meshes — watertight & manifold, ready to slice. Runs entirely on your device.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f1216",
+  "theme_color": "#0f1216",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

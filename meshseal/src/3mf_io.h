@@ -16,6 +16,10 @@ struct ThreeMfError : std::runtime_error {
 // Throws ThreeMfError on malformed input.
 Mesh read_3mf(const std::filesystem::path& path);
 
+// In-memory variant of read_3mf — reads a 3MF archive from a byte buffer
+// (no filesystem). Used by the WebAssembly build, which has no file paths.
+Mesh read_3mf_bytes(const uint8_t* data, size_t size);
+
 // One named volume parsed from a 3MF file. Multi-color / multi-part 3MFs
 // from PrusaSlicer (and others) pack several shells into a single
 // <object> in the main model and put the per-shell triangle-index
@@ -31,8 +35,14 @@ struct ThreeMfVolume {
 };
 std::vector<ThreeMfVolume> read_3mf_volumes(const std::filesystem::path& path);
 
+// In-memory variant of read_3mf_volumes (WebAssembly / no-filesystem).
+std::vector<ThreeMfVolume> read_3mf_volumes_bytes(const uint8_t* data, size_t size);
+
 // Write mesh as minimal 3MF. Coordinates written as full-precision decimal strings.
 void write_3mf(const Mesh& mesh, const std::filesystem::path& path);
+
+// In-memory variant of write_3mf — returns the 3MF archive as a byte buffer.
+std::vector<uint8_t> write_3mf_bytes(const Mesh& mesh);
 
 // Write a multi-volume 3MF: separate <object> per ThreeMfVolume, each
 // with its own <vertices>/<triangles>. The <build> section lists all
@@ -50,5 +60,11 @@ void write_3mf(const Mesh& mesh, const std::filesystem::path& path);
 void write_3mf_volumes(const std::vector<ThreeMfVolume>& volumes,
                        const std::filesystem::path& path,
                        bool write_slic3r_config = true);
+
+// In-memory variant of write_3mf_volumes (WebAssembly / no-filesystem) —
+// returns the multi-<object> 3MF archive as a byte buffer.
+std::vector<uint8_t> write_3mf_volumes_bytes(
+    const std::vector<ThreeMfVolume>& volumes,
+    bool write_slic3r_config = true);
 
 } // namespace meshseal

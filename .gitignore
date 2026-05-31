@@ -47,3 +47,9 @@ Thumbs.db
 desktop.ini
 .DS_Store
 /build-wsl
+/build-wasm
+# Built WASM engine copied into the web app for local serving — build
+# outputs, not source. Regenerate with the build recipe in
+# docs/wasm_webapp_plan.md §8.1.
+/wasm/web/meshseal.js
+/wasm/web/meshseal.wasm
