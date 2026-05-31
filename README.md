@@ -3,6 +3,9 @@
 A C++17 mesh repair library and CLI for 3D printing. Reads STL or 3MF,
 outputs a watertight 2-manifold solid suitable for slicing.
 
+**▶ Try it in your browser: [meshseal web app](https://jkavalik.github.io/meshseal/)** — free,
+runs entirely on your device (no upload), installable and offline-capable.
+
 > **Status: 0.1.3 — alpha.** APIs are not stable; the library is being
 > developed against a real-world corpus of 148 defective fixtures plus
 > ~1200 anomalous real-world STLs from a developer's print archive.
@@ -34,6 +37,23 @@ from print archives: **~97% CLEAN** end-to-end.
 
 See [How it compares](#how-it-compares) for benchmark numbers vs
 other open-source repair tools.
+
+## Use it in your browser
+
+A free, client-side web app runs the full repair pipeline in your browser
+via WebAssembly — **[meshseal web app](https://jkavalik.github.io/meshseal/)**:
+
+- Drag in an **STL or 3MF** (multi-volume 3MF preserved) and download a
+  watertight, manifold result — STL or 3MF.
+- **Nothing is uploaded.** Repair runs entirely on your device; the mesh
+  never leaves the browser.
+- **3D before/after preview** highlights problems — red marks holes and
+  inverted normals, cyan marks open edges.
+- **Installable + offline** (PWA): install it once and it works with no
+  network.
+
+No account, no server — it's a static page, so it costs nothing to run and
+has nothing to leak. For very large meshes or scripting, use the CLI below.
 
 ## Quick start
 
