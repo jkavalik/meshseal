@@ -1,0 +1,80 @@
+# Build the WebAssembly engine and publish the in-browser web app
+# (wasm/web/) to GitHub Pages.
+#
+# The built meshseal.js / meshseal.wasm are gitignored, so this workflow
+# builds them with Emscripten and copies them next to the static web files
+# before uploading. Nothing build-generated is committed to the repo.
+#
+# One-time setup: in the repository Settings -> Pages, set
+# "Build and deployment" -> Source to "GitHub Actions".
+#
+# The site is served at https://<owner>.github.io/<repo>/ (a subpath); the
+# app uses only relative URLs (manifest start_url/scope "./", relative SW
+# registration + import map), so it works under that subpath unchanged.
+
+name: Deploy web app to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'wasm/**'
+      - 'meshseal/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel in-progress runs for the same ref.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 5.0.7
+
+      - name: Build the WASM engine
+        run: |
+          emcmake cmake -S . -B build-wasm \
+            -DMESHSEAL_BUILD_WASM=ON \
+            -DMESHSEAL_BUILD_CLI=OFF \
+            -DMESHSEAL_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-wasm --target meshseal_wasm -j"$(nproc)"
+
+      - name: Assemble the site
+        run: cp build-wasm/wasm/meshseal.js build-wasm/wasm/meshseal.wasm wasm/web/
+
+      # Stamp the service-worker cache key with this commit's short SHA, so
+      # the cache busts automatically on every deploy (no manual bump). The
+      # SHA is hex, so it's sed-safe.
+      - name: Stamp service-worker cache version
+        run: sed -i "s/meshseal-__BUILD_ID__/meshseal-${GITHUB_SHA::8}/" wasm/web/sw.js
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: wasm/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

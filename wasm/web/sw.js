@@ -6,10 +6,16 @@
 // it makes repeat visits instant and lets the whole app work offline once
 // installed.
 //
-// IMPORTANT: bump CACHE on every deploy (it is the cache-bust key). The new
-// service worker takes over on the next load (skipWaiting + clients.claim)
-// and purges older caches on activate, so users never get a stale engine.
-const CACHE = 'meshseal-v0.1.3-7';
+// CACHE is the cache-bust key: a new value makes the incoming service worker
+// take over on the next load (skipWaiting + clients.claim) and purge older
+// caches on activate, so users never get a stale engine.
+//
+// The `__BUILD_ID__` placeholder is replaced with the git commit SHA at
+// deploy time by the Pages workflow (.github/workflows/pages.yml), so the
+// key updates automatically on every deploy — no manual bump needed. When
+// serving locally without CI it stays the literal placeholder, which is fine
+// for development (clear the cache / unregister the SW when iterating).
+const CACHE = 'meshseal-__BUILD_ID__';
 
 const ASSETS = [
   './',
